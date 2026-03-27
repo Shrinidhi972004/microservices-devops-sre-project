@@ -1,0 +1,16 @@
+global:
+  imagePullPolicy: IfNotPresent
+
+services:
+  frontend:
+    replicas: 1
+    hpa:
+      enabled: false
+  cartservice:
+    replicas: 1
+    hpa:
+      enabled: false
+  checkoutservice:
+    replicas: 1
+    hpa:
+      enabled: false
