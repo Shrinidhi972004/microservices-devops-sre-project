@@ -1,0 +1,14 @@
+apiVersion: v2
+name: online-boutique
+description: Production-grade Helm chart for Online Boutique microservices — built from scratch for DevOps/SRE portfolio
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - microservices
+  - devops
+  - sre
+  - kubernetes
+maintainers:
+  - name: Shrinidhi972004
+    email: shrinidhiupadhyaya00@gmail.com
