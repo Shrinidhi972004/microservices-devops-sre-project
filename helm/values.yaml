@@ -8,6 +8,8 @@ services:
     replicas: 1
     port: 8080
     env:
+      - name: SHOPPING_ASSISTANT_SERVICE_ADDR
+        value: ""
       - name: AD_SERVICE_ADDR
         value: "adservice:9555"
       - name: CART_SERVICE_ADDR
