@@ -1,0 +1,35 @@
+{{- range $name, $svc := .Values.services }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "online-boutique.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ $name }}
+spec:
+  type: {{ if eq $name "frontend" }}NodePort{{ else }}ClusterIP{{ end }}
+  selector:
+    app: {{ $name }}
+  ports:
+    - port: {{ $svc.port }}
+      targetPort: {{ $svc.port }}
+      {{- if eq $name "frontend" }}
+      nodePort: 30080
+      {{- end }}
+---
+{{- end }}
+{{- if .Values.redis.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cart
+  labels:
+    {{- include "online-boutique.labels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: redis-cart
+  ports:
+    - port: {{ .Values.redis.port }}
+      targetPort: {{ .Values.redis.port }}
+{{- end }}
