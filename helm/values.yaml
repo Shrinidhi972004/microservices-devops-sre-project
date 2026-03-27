@@ -1,0 +1,296 @@
+global:
+  imagePullPolicy: IfNotPresent
+
+services:
+  frontend:
+    image: gcr.io/google-samples/microservices-demo/frontend
+    tag: v0.10.1
+    replicas: 1
+    port: 8080
+    env:
+      - name: AD_SERVICE_ADDR
+        value: "adservice:9555"
+      - name: CART_SERVICE_ADDR
+        value: "cartservice:7070"
+      - name: CHECKOUT_SERVICE_ADDR
+        value: "checkoutservice:5050"
+      - name: CURRENCY_SERVICE_ADDR
+        value: "currencyservice:7000"
+      - name: PRODUCT_CATALOG_SERVICE_ADDR
+        value: "productcatalogservice:3550"
+      - name: RECOMMENDATION_SERVICE_ADDR
+        value: "recommendationservice:8080"
+      - name: SHIPPING_SERVICE_ADDR
+        value: "shippingservice:50051"
+      - name: ENABLE_PROFILER
+        value: "0"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: false
+      minAvailable: 1
+
+  cartservice:
+    image: gcr.io/google-samples/microservices-demo/cartservice
+    tag: v0.10.1
+    replicas: 1
+    port: 7070
+    env:
+      - name: REDIS_ADDR
+        value: "redis-cart:6379"
+    resources:
+      requests:
+        cpu: 200m
+        memory: 64Mi
+      limits:
+        cpu: 300m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  productcatalogservice:
+    image: gcr.io/google-samples/microservices-demo/productcatalogservice
+    tag: v0.10.1
+    replicas: 1
+    port: 3550
+    env:
+      - name: PORT
+        value: "3550"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  currencyservice:
+    image: gcr.io/google-samples/microservices-demo/currencyservice
+    tag: v0.10.1
+    replicas: 1
+    port: 7000
+    env:
+      - name: PORT
+        value: "7000"
+      - name: DISABLE_PROFILER
+        value: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  paymentservice:
+    image: gcr.io/google-samples/microservices-demo/paymentservice
+    tag: v0.10.1
+    replicas: 1
+    port: 50051
+    env:
+      - name: PORT
+        value: "50051"
+      - name: DISABLE_PROFILER
+        value: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  shippingservice:
+    image: gcr.io/google-samples/microservices-demo/shippingservice
+    tag: v0.10.1
+    replicas: 1
+    port: 50051
+    env:
+      - name: PORT
+        value: "50051"
+      - name: DISABLE_PROFILER
+        value: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  emailservice:
+    image: gcr.io/google-samples/microservices-demo/emailservice
+    tag: v0.10.1
+    replicas: 1
+    port: 8080
+    env:
+      - name: PORT
+        value: "8080"
+      - name: DISABLE_PROFILER
+        value: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  recommendationservice:
+    image: gcr.io/google-samples/microservices-demo/recommendationservice
+    tag: v0.10.1
+    replicas: 1
+    port: 8080
+    env:
+      - name: PORT
+        value: "8080"
+      - name: PRODUCT_CATALOG_SERVICE_ADDR
+        value: "productcatalogservice:3550"
+      - name: DISABLE_PROFILER
+        value: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 220Mi
+      limits:
+        cpu: 200m
+        memory: 450Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  adservice:
+    image: gcr.io/google-samples/microservices-demo/adservice
+    tag: v0.10.1
+    replicas: 1
+    port: 9555
+    env:
+      - name: PORT
+        value: "9555"
+      - name: DISABLE_STATS
+        value: "1"
+    resources:
+      requests:
+        cpu: 200m
+        memory: 180Mi
+      limits:
+        cpu: 300m
+        memory: 300Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  checkoutservice:
+    image: gcr.io/google-samples/microservices-demo/checkoutservice
+    tag: v0.10.1
+    replicas: 1
+    port: 5050
+    env:
+      - name: PORT
+        value: "5050"
+      - name: PRODUCT_CATALOG_SERVICE_ADDR
+        value: "productcatalogservice:3550"
+      - name: SHIPPING_SERVICE_ADDR
+        value: "shippingservice:50051"
+      - name: PAYMENT_SERVICE_ADDR
+        value: "paymentservice:50051"
+      - name: EMAIL_SERVICE_ADDR
+        value: "emailservice:8080"
+      - name: CURRENCY_SERVICE_ADDR
+        value: "currencyservice:7000"
+      - name: CART_SERVICE_ADDR
+        value: "cartservice:7070"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 3
+      cpuUtilization: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+redis:
+  enabled: true
+  image: redis
+  tag: alpine
+  port: 6379
+  resources:
+    requests:
+      cpu: 70m
+      memory: 200Mi
+    limits:
+      cpu: 125m
+      memory: 256Mi
