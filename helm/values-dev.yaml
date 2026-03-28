@@ -3,7 +3,7 @@ global:
 
 services:
   frontend:
-    replicas: 1
+    replicas: 2
     hpa:
       enabled: false
   cartservice:
