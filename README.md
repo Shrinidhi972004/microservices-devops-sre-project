@@ -20,10 +20,7 @@ This is the difference between knowing how to use a tool and knowing how to engi
 - [Architecture](#architecture)
 - [Repository structure](#repository-structure)
 - [Phase 1 — Helm chart](#phase-1--helm-chart)
-  - [Prerequisites](#prerequisites)
-  - [Local deployment with kind](#local-deployment-with-kind)
-  - [Helm chart design decisions](#helm-chart-design-decisions)
-  - [Debugging a real production issue](#debugging-a-real-production-issue)
+- [Phase 2 — GitOps with ArgoCD](#phase-2--gitops-with-argocd)
 - [Roadmap](#roadmap)
 - [Tech stack](#tech-stack)
 
@@ -44,7 +41,7 @@ The goal is not just to deploy the app, but to **operate it like a production SR
 | No resource limits | CPU/memory requests and limits on every pod |
 | No pod disruption budgets | PDBs on all stateful services |
 | No autoscaling | HPA configured on all 10 services |
-| No GitOps | ArgoCD watching GitHub, auto-syncing on push *(coming)* |
+| Manual kubectl apply to deploy | ArgoCD auto-syncs on every GitHub push |
 | No observability | Prometheus + Grafana SLO dashboards *(coming)* |
 | No chaos testing | LitmusChaos experiments + postmortems *(coming)* |
 
@@ -114,8 +111,9 @@ User → frontend (Go, HTTP)
 │       ├── service.yaml
 │       ├── hpa.yaml
 │       └── poddisruptionbudget.yaml
+├── argocd/
+│   └── application.yaml          # ArgoCD Application manifest
 ├── terraform/                    # IaC for AWS EKS — coming in Phase 3
-├── argocd/                       # GitOps config — coming in Phase 2
 ├── monitoring/                   # Observability stack — coming in Phase 4
 ├── chaos/                        # Chaos experiments — coming in Phase 5
 ├── runbooks/                     # Operational runbooks — coming in Phase 5
@@ -123,8 +121,6 @@ User → frontend (Go, HTTP)
 ```
 
 ### Everything deleted from upstream and why
-
-The upstream repo was forked and the following were **completely deleted**. Each was rebuilt independently for this project:
 
 | Deleted from upstream | Why deleted | Rebuilt as |
 |---|---|---|
@@ -177,15 +173,6 @@ kind create cluster --name boutique --config kind-config.yaml
 kubectl get nodes
 ```
 
-Expected — 4 nodes all `Ready`:
-```
-NAME                     STATUS   ROLES
-boutique-control-plane   Ready    control-plane
-boutique-worker          Ready    <none>
-boutique-worker2         Ready    <none>
-boutique-worker3         Ready    <none>
-```
-
 **2. Deploy with Helm**
 
 ```bash
@@ -196,22 +183,6 @@ helm install boutique ./helm \
   --create-namespace
 
 kubectl get pods -n boutique
-```
-
-Expected — all 11 pods `Running`:
-```
-NAME                                     READY   STATUS
-adservice-xxx                            1/1     Running
-cartservice-xxx                          1/1     Running
-checkoutservice-xxx                      1/1     Running
-currencyservice-xxx                      1/1     Running
-emailservice-xxx                         1/1     Running
-frontend-xxx                             1/1     Running
-paymentservice-xxx                       1/1     Running
-productcatalogservice-xxx                1/1     Running
-recommendationservice-xxx                1/1     Running
-redis-cart-xxx                           1/1     Running
-shippingservice-xxx                      1/1     Running
 ```
 
 **3. Access the frontend**
@@ -235,17 +206,11 @@ helm uninstall boutique --namespace boutique
 kind delete cluster --name boutique
 ```
 
----
-
 ### Helm chart design decisions
 
 **One template per resource type, not per service**
 
-Most beginners write 10 separate deployment YAML files — one per service. This chart uses a single `deployment.yaml` that iterates over all services defined in `values.yaml` using `{{- range $name, $svc := .Values.services }}`. This means:
-
-- Adding a new service = one block in `values.yaml`, zero new template files
-- Resource limits and security contexts are consistent across all services
-- Environment-specific overrides are handled entirely through `values-dev.yaml` and `values-prod.yaml`
+A single `deployment.yaml` iterates over all services using `{{- range $name, $svc := .Values.services }}`. Adding a new service requires only one block in `values.yaml` — zero new template files.
 
 **Security context on every pod**
 
@@ -262,66 +227,156 @@ securityContext:
       - ALL
 ```
 
-No container runs as root. No container can escalate privileges. This follows the principle of least privilege and would pass a basic CIS Kubernetes benchmark audit.
+No container runs as root. No container can escalate privileges.
 
 **HPA on all 10 services**
 
-Horizontal Pod Autoscaler is configured for every service with a default CPU utilisation target of 70%. Disabled in `values-dev.yaml` to conserve local resources. Active in prod and validated under k6 load in Phase 5.
+Horizontal Pod Autoscaler configured for every service with 70% CPU utilisation target. Disabled in `values-dev.yaml` to conserve local resources.
 
 **PodDisruptionBudget on all backend services**
 
-All services except frontend have `minAvailable: 1`. This ensures Kubernetes will not evict the last running pod of a service during node drain or rolling updates — preserving availability across the 3-worker cluster.
+All services except frontend have `minAvailable: 1` — Kubernetes will not evict the last running pod during node drain or rolling updates.
 
 **Frontend as NodePort, all others as ClusterIP**
 
-Only the frontend is exposed externally via `NodePort: 30080`. All backend services are `ClusterIP` — reachable only within the cluster. All external traffic enters through the frontend, which is the correct security posture.
-
----
+Only the frontend is exposed externally. All backend services are reachable only within the cluster.
 
 ### Debugging a real production issue
 
-During the initial deployment, the frontend entered `CrashLoopBackOff` while all other 9 services started successfully. This is documented as a real debugging exercise.
-
-**Symptoms:**
-```bash
-kubectl get pods -n boutique
-# frontend-xxx   0/1   CrashLoopBackOff   4   6m
-```
+During initial deployment the frontend entered `CrashLoopBackOff` while all other 9 services started successfully.
 
 **Diagnosis:**
 ```bash
 kubectl logs frontend-xxx -n boutique
-```
-```
-panic: environment variable "SHOPPING_ASSISTANT_SERVICE_ADDR" not set
+# panic: environment variable "SHOPPING_ASSISTANT_SERVICE_ADDR" not set
 ```
 
-**Root cause:**
-
-`v0.10.1` introduced a new required env variable `SHOPPING_ASSISTANT_SERVICE_ADDR`. The app's `mustMapEnv` function in Go panics if any required env var is empty or unset:
-
-```go
-func mustMapEnv(target *string, envKey string) {
-    v := os.Getenv(envKey)
-    if v == "" {
-        panic(fmt.Sprintf("environment variable %q not set", envKey))
-    }
-    *target = v
-}
-```
-
-Setting `value: ""` in `values.yaml` did not work — Kubernetes silently strips empty string values from the env spec, so the variable was never injected into the container at all.
+**Root cause:** `v0.10.1` introduced a new required env variable. The app's `mustMapEnv` function panics if any required env var is empty or unset. Setting `value: ""` in `values.yaml` did not work — Kubernetes silently strips empty string values from the env spec entirely.
 
 **Fix:**
-
-Set a non-empty placeholder address. The shopping assistant feature only attempts to connect when explicitly triggered — pointing to a non-existent service causes no runtime errors for normal app usage:
-
 ```yaml
 - name: SHOPPING_ASSISTANT_SERVICE_ADDR
   value: "shoppingassistantservice:80"
 ```
 
-**Lesson:** Always check required env var patterns when upgrading image versions of upstream services. Kubernetes silently drops `value: ""` env entries — an empty string in YAML does not mean the variable will be present in the container.
+**Lesson:** Kubernetes silently drops `value: ""` env entries. Always use a non-empty placeholder when a required env var points to an optional or non-existent service.
+
+---
+
+## Phase 2 — GitOps with ArgoCD
+
+**Status: complete and validated on kind**
+
+### How it works
+
+```
+Push to GitHub (helm/values.yaml)
+        │
+        ▼
+ArgoCD detects drift (polls every 3 min)
+        │
+        ▼
+ArgoCD syncs Helm chart to cluster
+        │
+        ▼
+Cluster reflects GitHub state exactly
+```
+
+GitHub is the single source of truth. Nobody runs `kubectl apply` or `helm upgrade` manually — every change goes through Git.
+
+### ArgoCD installation
+
+ArgoCD is installed via Helm — not raw `kubectl apply` — so it is versioned, reproducible, and upgradeable:
+
+```bash
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+kubectl create namespace argocd
+
+helm install argocd argo/argo-cd \
+  --namespace argocd \
+  --set configs.params."server\.insecure"=true
+
+kubectl get pods -n argocd
+```
+
+### ArgoCD Application manifest
+
+The `argocd/application.yaml` defines what ArgoCD watches and where it deploys:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: online-boutique
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Shrinidhi972004/microservices-devops-sre-project.git
+    targetRevision: main
+    path: helm
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-dev.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: boutique
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+```
+
+Key flags:
+- `automated` — no manual sync needed, ArgoCD polls GitHub every 3 minutes
+- `selfHeal: true` — if someone manually changes the cluster, ArgoCD reverts it back to what GitHub says
+- `prune: true` — if a service is removed from `values.yaml`, ArgoCD deletes it from the cluster
+- `CreateNamespace=true` — ArgoCD creates the `boutique` namespace if it doesn't exist
+
+### Apply the Application
+
+```bash
+kubectl apply -f argocd/application.yaml
+
+# Check sync status
+kubectl get application -n argocd
+```
+
+### Access the ArgoCD UI
+
+```bash
+# Get admin password
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d && echo
+
+# Port forward
+kubectl port-forward svc/argocd-server 8081:80 -n argocd
+```
+
+Open `http://localhost:8081` — login with username `admin`.
+
+### GitOps validation
+
+To prove the loop works — change a value in `values-dev.yaml`, push to GitHub, and watch ArgoCD sync it without touching the cluster:
+
+```bash
+# Example: scale frontend to 2 replicas
+# Edit helm/values-dev.yaml → frontend.replicas: 2
+git add .
+git commit -m "test: scale frontend to 2 replicas"
+git push origin main
+
+# Watch pods — second frontend appears automatically
+kubectl get pods -n boutique -w
+```
+
+ArgoCD syncs within ~3 minutes. The cluster never needs to be touched directly.
 
 ---
 
@@ -330,8 +385,8 @@ Set a non-empty placeholder address. The shopping assistant feature only attempt
 | Phase | Status | Description |
 |---|---|---|
 | Phase 1 — Helm chart | ✅ Complete | Single Helm chart for all 10 services, validated on kind |
-| Phase 2 — GitOps with ArgoCD | 🔄 In progress | ArgoCD watching GitHub, auto-sync on every push |
-| Phase 3 — Terraform + AWS EKS | ⏳ Planned | Terraform modules for EKS, same Helm chart promoted to AWS |
+| Phase 2 — GitOps with ArgoCD | ✅ Complete | ArgoCD watching GitHub, auto-sync with self-healing on every push |
+| Phase 3 — Terraform + AWS EKS | 🔄 In progress | Terraform modules for EKS, same Helm chart promoted to AWS |
 | Phase 4 — Observability | ⏳ Planned | Prometheus + Grafana SLO dashboards, Loki, Jaeger tracing |
 | Phase 5 — Chaos engineering | ⏳ Planned | LitmusChaos experiments, k6 load tests, postmortems, runbooks |
 
