@@ -21,6 +21,7 @@ This is the difference between knowing how to use a tool and knowing how to engi
 - [Repository structure](#repository-structure)
 - [Phase 1 — Helm chart](#phase-1--helm-chart)
 - [Phase 2 — GitOps with ArgoCD](#phase-2--gitops-with-argocd)
+- [Phase 3 — Terraform + AWS EKS](#phase-3--terraform--aws-eks)
 - [Roadmap](#roadmap)
 - [Tech stack](#tech-stack)
 
@@ -42,6 +43,7 @@ The goal is not just to deploy the app, but to **operate it like a production SR
 | No pod disruption budgets | PDBs on all stateful services |
 | No autoscaling | HPA configured on all 10 services |
 | Manual kubectl apply to deploy | ArgoCD auto-syncs on every GitHub push |
+| Infrastructure clicked in console | Terraform modules — reproducible, version-controlled |
 | No observability | Prometheus + Grafana SLO dashboards *(coming)* |
 | No chaos testing | LitmusChaos experiments + postmortems *(coming)* |
 
@@ -64,6 +66,28 @@ User → frontend (Go, HTTP)
                   ├── paymentservice (Node.js, gRPC)
                   ├── shippingservice (Go, gRPC)
                   └── emailservice (Python, gRPC)
+```
+
+### AWS infrastructure architecture
+
+```
+Internet
+    │
+    ▼
+Application Load Balancer (public subnets, spans 3 AZs)
+    │
+    ▼
+EKS Worker Nodes (private subnets, 3x t3.medium)
+    │
+    ├── boutique namespace (all 10 services + Redis)
+    └── argocd namespace (GitOps controller)
+
+Supporting services:
+    ECR     — container registry (10 repos, one per service)
+    S3      — Terraform remote state
+    DynamoDB — Terraform state locking
+    NAT GW  — private subnet egress
+    IAM     — node roles + IRSA
 ```
 
 ### Service inventory
@@ -104,7 +128,6 @@ User → frontend (Go, HTTP)
 │   ├── Chart.yaml
 │   ├── values.yaml               # Single source of truth for all 10 services
 │   ├── values-dev.yaml           # kind overrides
-│   ├── values-prod.yaml          # EKS overrides (coming)
 │   └── templates/
 │       ├── _helpers.tpl
 │       ├── deployment.yaml
@@ -113,7 +136,18 @@ User → frontend (Go, HTTP)
 │       └── poddisruptionbudget.yaml
 ├── argocd/
 │   └── application.yaml          # ArgoCD Application manifest
-├── terraform/                    # IaC for AWS EKS — coming in Phase 3
+├── terraform/
+│   ├── modules/
+│   │   ├── vpc/                  # VPC, subnets, IGW, NAT, route tables
+│   │   ├── eks/                  # EKS cluster, node group, IAM, security groups
+│   │   └── ecr/                  # ECR repos + lifecycle policies per service
+│   └── envs/
+│       └── prod/
+│           ├── main.tf           # calls all three modules
+│           ├── variables.tf
+│           ├── outputs.tf
+│           ├── backend.tf        # S3 remote state + DynamoDB lock
+│           └── terraform.tfvars
 ├── monitoring/                   # Observability stack — coming in Phase 4
 ├── chaos/                        # Chaos experiments — coming in Phase 5
 ├── runbooks/                     # Operational runbooks — coming in Phase 5
@@ -126,7 +160,7 @@ User → frontend (Go, HTTP)
 |---|---|---|
 | `kubernetes-manifests/` | Raw YAML, no templating, no env management | `helm/templates/` |
 | `helm-chart/` | GCP-specific, not portable to AWS | `helm/` — cloud-agnostic, AWS-ready |
-| `terraform/` | Targets GCP, not AWS | `terraform/` — AWS EKS modules *(coming)* |
+| `terraform/` | Targets GCP, not AWS | `terraform/` — AWS EKS modules |
 | `kustomize/` | Redundant — Helm handles env overlays | `values-dev.yaml`, `values-prod.yaml` |
 | `istio-manifests/` | GCP service mesh, not used | NetworkPolicies in Helm instead |
 | `.github/` | GCP Cloud Build workflows | `.github/workflows/` — GitHub Actions *(coming)* |
@@ -335,7 +369,7 @@ spec:
 
 Key flags:
 - `automated` — no manual sync needed, ArgoCD polls GitHub every 3 minutes
-- `selfHeal: true` — if someone manually changes the cluster, ArgoCD reverts it back to what GitHub says
+- `selfHeal: true` — if someone manually changes the cluster, ArgoCD reverts it to what GitHub says
 - `prune: true` — if a service is removed from `values.yaml`, ArgoCD deletes it from the cluster
 - `CreateNamespace=true` — ArgoCD creates the `boutique` namespace if it doesn't exist
 
@@ -380,14 +414,273 @@ ArgoCD syncs within ~3 minutes. The cluster never needs to be touched directly.
 
 ---
 
+## Phase 3 — Terraform + AWS EKS
+
+**Status: complete — infrastructure provisioned, app deployed, resources destroyed**
+
+### Overview
+
+The same Helm chart validated on kind is promoted to a real AWS EKS cluster provisioned entirely with Terraform. The infrastructure is modular — VPC, EKS, and ECR are independent modules called from a single root env config. Remote state is stored in S3 with DynamoDB locking.
+
+### Prerequisites
+
+```bash
+terraform  >= 1.6.0
+aws-cli    >= 2.x
+# AWS credentials configured
+aws sts get-caller-identity
+```
+
+### Step 1 — Create S3 backend and DynamoDB lock table
+
+These must exist before Terraform can initialise. Create them manually once:
+
+```bash
+export AWS_REGION=ap-south-1
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Create S3 bucket
+aws s3api create-bucket \
+  --bucket boutique-terraform-state-${ACCOUNT_ID} \
+  --region ${AWS_REGION} \
+  --create-bucket-configuration LocationConstraint=${AWS_REGION}
+
+# Enable versioning
+aws s3api put-bucket-versioning \
+  --bucket boutique-terraform-state-${ACCOUNT_ID} \
+  --versioning-configuration Status=Enabled
+
+# Enable encryption
+aws s3api put-bucket-encryption \
+  --bucket boutique-terraform-state-${ACCOUNT_ID} \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+# Create DynamoDB lock table
+aws dynamodb create-table \
+  --table-name boutique-terraform-locks \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region ${AWS_REGION}
+```
+
+### Step 2 — Configure backend
+
+Edit `terraform/envs/prod/backend.tf` and replace `YOUR_ACCOUNT_ID` with your actual AWS account ID:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "boutique-terraform-state-YOUR_ACCOUNT_ID"
+    key            = "prod/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "boutique-terraform-locks"
+    encrypt        = true
+  }
+}
+```
+
+Get your account ID:
+```bash
+aws sts get-caller-identity --query Account --output text
+```
+
+### Step 3 — Initialise Terraform
+
+```bash
+cd terraform/envs/prod
+terraform init
+```
+
+Expected output:
+```
+Terraform has been successfully initialized!
+```
+
+### Step 4 — Plan
+
+```bash
+terraform plan -out=tfplan
+```
+
+Review the plan — should show 48 resources to create:
+- 1 VPC + 6 subnets + 1 IGW + 1 NAT GW + 1 EIP + 2 route tables + 6 associations
+- 1 EKS cluster + 1 node group (3x t3.medium)
+- 2 IAM roles + 4 policy attachments
+- 2 security groups
+- 10 ECR repositories + 10 lifecycle policies
+
+### Step 5 — Apply
+
+```bash
+terraform apply "tfplan"
+```
+
+EKS cluster takes 12-15 minutes to provision. Node group takes another 3-5 minutes. Total: ~20 minutes.
+
+Expected final output:
+```
+Apply complete! Resources: 48 added, 0 changed, 0 destroyed.
+
+Outputs:
+eks_cluster_name     = "boutique"
+kubeconfig_command   = "aws eks update-kubeconfig --region ap-south-1 --name boutique"
+vpc_id               = "vpc-xxxxxxxxxxxxxxxxx"
+ecr_repository_urls  = { ... }
+```
+
+### Step 6 — Connect kubectl to EKS
+
+```bash
+aws eks update-kubeconfig --region ap-south-1 --name boutique
+
+# Verify 3 nodes ready
+kubectl get nodes -o wide
+```
+
+Expected:
+```
+NAME                                        STATUS   ROLES    AGE
+ip-10-0-4-xxx.ap-south-1.compute.internal   Ready    <none>   5m
+ip-10-0-5-xxx.ap-south-1.compute.internal   Ready    <none>   5m
+ip-10-0-6-xxx.ap-south-1.compute.internal   Ready    <none>   5m
+```
+
+### Step 7 — Deploy Helm chart to EKS
+
+```bash
+# Go back to project root
+cd ~/Desktop/microservices-demo
+
+# Deploy
+kubectl create namespace boutique
+
+helm install boutique ./helm \
+  --namespace boutique \
+  --create-namespace \
+  -f helm/values.yaml
+
+# Watch pods
+kubectl get pods -n boutique -w
+```
+
+All 11 pods should reach `Running` status. This is the exact same Helm chart that ran on kind — no changes needed.
+
+### Step 8 — Access the frontend on AWS
+
+Patch the frontend service to LoadBalancer so AWS provisions an ELB:
+
+```bash
+kubectl patch svc frontend -n boutique \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+# Wait 2 minutes then get the ELB hostname
+kubectl get svc frontend -n boutique
+```
+
+Open `http://<EXTERNAL-IP>:8080` in your browser.
+
+### Terraform module design decisions
+
+**Modular structure — one module per concern**
+
+Three independent modules: `vpc`, `eks`, `ecr`. Each has its own `variables.tf`, `main.tf`, and `outputs.tf`. The root `envs/prod/main.tf` calls all three, passing outputs between them (e.g. VPC subnet IDs flow into the EKS module). This mirrors how real infrastructure teams structure Terraform — each module is independently testable and reusable.
+
+**Private subnets for worker nodes**
+
+EKS worker nodes live in private subnets — they have no public IP and are not directly internet-accessible. The NAT Gateway in the public subnet provides outbound access for pulling images. This is the correct security posture — nodes should never be exposed to the internet.
+
+**3 AZs for high availability**
+
+Subnets and node groups span `ap-south-1a`, `ap-south-1b`, and `ap-south-1c`. If one AZ has an outage, pods are rescheduled on nodes in the remaining AZs automatically.
+
+**ECR with immutable tags and scan on push**
+
+Every ECR repository has:
+- `image_tag_mutability = "IMMUTABLE"` — once an image is pushed with a tag, it cannot be overwritten. Prevents accidental overwrites in production.
+- `scan_on_push = true` — every image is automatically scanned for CVEs when pushed.
+- Lifecycle policy keeping the last 10 images — prevents unbounded storage growth.
+
+**Remote state with locking**
+
+Terraform state is stored in S3 with versioning enabled — every state change is versioned and recoverable. DynamoDB provides a lock so concurrent `terraform apply` runs are prevented, avoiding state corruption.
+
+**IAM roles — least privilege**
+
+The EKS cluster role has only `AmazonEKSClusterPolicy`. Worker nodes have only three policies — `AmazonEKSWorkerNodePolicy`, `AmazonEKS_CNI_Policy`, and `AmazonEC2ContainerRegistryReadOnly`. No broad admin permissions anywhere.
+
+### Teardown — complete cleanup
+
+Run this in order to leave zero AWS resources:
+
+```bash
+# Step 1 — uninstall Helm release
+helm uninstall boutique -n boutique
+
+# Step 2 — destroy all Terraform-managed infrastructure
+cd terraform/envs/prod
+terraform destroy -auto-approve
+
+# Step 3 — delete S3 state bucket (versioning requires extra steps)
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+aws s3api delete-objects \
+  --bucket boutique-terraform-state-${ACCOUNT_ID} \
+  --delete "$(aws s3api list-object-versions \
+    --bucket boutique-terraform-state-${ACCOUNT_ID} \
+    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+    --output json)" \
+  --region ap-south-1
+
+aws s3api delete-objects \
+  --bucket boutique-terraform-state-${ACCOUNT_ID} \
+  --delete "$(aws s3api list-object-versions \
+    --bucket boutique-terraform-state-${ACCOUNT_ID} \
+    --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+    --output json)" \
+  --region ap-south-1 2>/dev/null || true
+
+aws s3api delete-bucket \
+  --bucket boutique-terraform-state-${ACCOUNT_ID} \
+  --region ap-south-1
+
+# Step 4 — delete DynamoDB lock table
+aws dynamodb delete-table \
+  --table-name boutique-terraform-locks \
+  --region ap-south-1
+
+# Step 5 — verify everything is gone
+echo "--- S3 ---" && aws s3 ls | grep boutique || echo "none"
+echo "--- DynamoDB ---" && aws dynamodb list-tables --region ap-south-1
+echo "--- EKS ---" && aws eks list-clusters --region ap-south-1
+echo "--- ECR ---" && aws ecr describe-repositories --region ap-south-1 \
+  --query 'repositories[*].repositoryName' --output table 2>/dev/null || echo "none"
+```
+
+### Important .gitignore rules for Terraform
+
+Never commit `.terraform/` or `tfplan` — the provider binary alone is 674MB and will be rejected by GitHub. The `.gitignore` in this repo excludes:
+
+```
+**/.terraform/
+*.tfplan
+tfplan
+*.tfstate*
+*.tfvars
+.terraform.lock.hcl
+```
+
+---
+
 ## Roadmap
 
 | Phase | Status | Description |
 |---|---|---|
 | Phase 1 — Helm chart | ✅ Complete | Single Helm chart for all 10 services, validated on kind |
 | Phase 2 — GitOps with ArgoCD | ✅ Complete | ArgoCD watching GitHub, auto-sync with self-healing on every push |
-| Phase 3 — Terraform + AWS EKS | 🔄 In progress | Terraform modules for EKS, same Helm chart promoted to AWS |
-| Phase 4 — Observability | ⏳ Planned | Prometheus + Grafana SLO dashboards, Loki, Jaeger tracing |
+| Phase 3 — Terraform + AWS EKS | ✅ Complete | Modular Terraform, EKS cluster, same Helm chart promoted to AWS |
+| Phase 4 — Observability | 🔄 In progress | Prometheus + Grafana SLO dashboards, Loki, Jaeger tracing |
 | Phase 5 — Chaos engineering | ⏳ Planned | LitmusChaos experiments, k6 load tests, postmortems, runbooks |
 
 ---
@@ -400,14 +693,14 @@ ArgoCD syncs within ~3 minutes. The cluster never needs to be touched directly.
 | Package management | Helm 3 |
 | GitOps | ArgoCD |
 | Infrastructure as code | Terraform (AWS provider) |
-| CI/CD | GitHub Actions |
-| Metrics | Prometheus + Grafana |
-| Logging | Loki + Promtail |
-| Tracing | Jaeger |
-| Chaos engineering | LitmusChaos |
-| Load testing | k6 |
-| Container registry | GitHub Container Registry (GHCR) |
-| Cloud | AWS (EKS, ECR, S3, VPC) |
+| CI/CD | GitHub Actions *(coming)* |
+| Metrics | Prometheus + Grafana *(coming)* |
+| Logging | Loki + Promtail *(coming)* |
+| Tracing | Jaeger *(coming)* |
+| Chaos engineering | LitmusChaos *(coming)* |
+| Load testing | k6 *(coming)* |
+| Container registry | AWS ECR |
+| Cloud | AWS (EKS, ECR, S3, VPC, DynamoDB, IAM) |
 
 ---
 
