@@ -7,6 +7,7 @@
 .skaffold-*.yaml
 .terraform.lock.hcl
 .terraform/*
+**/.terraform/
 .venv/
 .vs/
 .vscode/
@@ -26,3 +27,5 @@ obj/
 pkg/
 release/wi-kubernetes-manifests.yaml
 vendor/
+tfplan
+*.tfplan
