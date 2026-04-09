@@ -1,0 +1,253 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: boutique-slo-rules
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+
+    # -------------------------------------------------------
+    # Recording rules — pre-compute SLI metrics
+    # -------------------------------------------------------
+    - name: boutique.sli.recording
+      interval: 30s
+      rules:
+
+        # Request rate per service (frontend only exposes HTTP metrics)
+        - record: boutique:http_requests:rate5m
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{namespace="boutique"}[5m])
+            )
+
+        # Error rate per service
+        - record: boutique:http_errors:rate5m
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{namespace="boutique", status=~"5.."}[5m])
+            )
+
+        # Error ratio (0–1) — used for availability SLO burn rate
+        - record: boutique:http_error_ratio:rate5m
+          expr: |
+            boutique:http_errors:rate5m
+            /
+            boutique:http_requests:rate5m
+
+        # Latency — 95th percentile per service
+        - record: boutique:http_request_duration_p95:rate5m
+          expr: |
+            histogram_quantile(0.95,
+              sum by (job, le) (
+                rate(http_request_duration_seconds_bucket{namespace="boutique"}[5m])
+              )
+            )
+
+        # Latency — 99th percentile per service
+        - record: boutique:http_request_duration_p99:rate5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, le) (
+                rate(http_request_duration_seconds_bucket{namespace="boutique"}[5m])
+              )
+            )
+
+        # Pod availability — ratio of ready pods per deployment
+        - record: boutique:pod_availability:ratio
+          expr: |
+            sum by (deployment) (
+              kube_deployment_status_replicas_available{namespace="boutique"}
+            )
+            /
+            sum by (deployment) (
+              kube_deployment_spec_replicas{namespace="boutique"}
+            )
+
+    # -------------------------------------------------------
+    # SLO — Availability (target: 99.9%)
+    # Uses multi-window multi-burn-rate alerting (Google SRE book)
+    # -------------------------------------------------------
+    - name: boutique.slo.availability
+      rules:
+
+        # Fast burn — 1h window, 14x burn rate
+        # Fires when error budget is burning 14x faster than allowed
+        - alert: BoutiqueAvailabilitySLOFastBurn
+          expr: |
+            (
+              boutique:http_error_ratio:rate5m > (14 * 0.001)
+            )
+            and
+            (
+              sum(rate(http_errors_total{namespace="boutique"}[1h]))
+              /
+              sum(rate(http_requests_total{namespace="boutique"}[1h]))
+              > (14 * 0.001)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            slo: availability
+            service: boutique
+          annotations:
+            summary: "Boutique availability SLO fast burn (critical)"
+            description: >
+              Error rate is burning the availability error budget 14x faster than allowed.
+              Current error ratio: {{ $value | humanizePercentage }}.
+              SLO target: 99.9%. Immediate action required.
+            runbook_url: "https://github.com/Shrinidhi972004/microservices-devops-sre-project/tree/main/runbooks/availability-slo.md"
+
+        # Slow burn — 6h window, 6x burn rate
+        - alert: BoutiqueAvailabilitySLOSlowBurn
+          expr: |
+            (
+              sum(rate(http_errors_total{namespace="boutique"}[6h]))
+              /
+              sum(rate(http_requests_total{namespace="boutique"}[6h]))
+              > (6 * 0.001)
+            )
+            and
+            (
+              sum(rate(http_errors_total{namespace="boutique"}[30m]))
+              /
+              sum(rate(http_requests_total{namespace="boutique"}[30m]))
+              > (6 * 0.001)
+            )
+          for: 15m
+          labels:
+            severity: warning
+            slo: availability
+            service: boutique
+          annotations:
+            summary: "Boutique availability SLO slow burn (warning)"
+            description: >
+              Error rate is burning the availability error budget 6x faster than allowed over 6h.
+              Current error ratio: {{ $value | humanizePercentage }}.
+              SLO target: 99.9%.
+            runbook_url: "https://github.com/Shrinidhi972004/microservices-devops-sre-project/tree/main/runbooks/availability-slo.md"
+
+    # -------------------------------------------------------
+    # SLO — Latency (target: 95% of requests < 500ms)
+    # -------------------------------------------------------
+    - name: boutique.slo.latency
+      rules:
+
+        # Fast burn — p95 latency exceeds SLO threshold
+        - alert: BoutiqueLatencySLOFastBurn
+          expr: |
+            boutique:http_request_duration_p95:rate5m > 0.5
+          for: 5m
+          labels:
+            severity: critical
+            slo: latency
+            service: boutique
+          annotations:
+            summary: "Boutique p95 latency SLO breached (critical)"
+            description: >
+              p95 latency is {{ $value | humanizeDuration }}, exceeding the 500ms SLO target.
+              Service: {{ $labels.job }}.
+            runbook_url: "https://github.com/Shrinidhi972004/microservices-devops-sre-project/tree/main/runbooks/latency-slo.md"
+
+        # Warning — p99 approaching threshold
+        - alert: BoutiqueLatencyP99High
+          expr: |
+            boutique:http_request_duration_p99:rate5m > 1.0
+          for: 5m
+          labels:
+            severity: warning
+            slo: latency
+            service: boutique
+          annotations:
+            summary: "Boutique p99 latency elevated"
+            description: >
+              p99 latency is {{ $value | humanizeDuration }}, exceeding 1s.
+              Service: {{ $labels.job }}.
+
+    # -------------------------------------------------------
+    # Infrastructure alerts — pods, restarts, OOM
+    # -------------------------------------------------------
+    - name: boutique.infrastructure
+      rules:
+
+        - alert: BoutiquePodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="boutique"}[15m]) * 60 > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: boutique
+          annotations:
+            summary: "Pod crash-looping in boutique namespace"
+            description: >
+              Pod {{ $labels.pod }} container {{ $labels.container }} is restarting
+              {{ $value | printf "%.2f" }} times/minute.
+
+        - alert: BoutiqueDeploymentReplicasMismatch
+          expr: |
+            kube_deployment_spec_replicas{namespace="boutique"}
+            !=
+            kube_deployment_status_replicas_available{namespace="boutique"}
+          for: 5m
+          labels:
+            severity: warning
+            service: boutique
+          annotations:
+            summary: "Deployment {{ $labels.deployment }} has unavailable replicas"
+            description: >
+              Deployment {{ $labels.deployment }} has {{ $value }} fewer available replicas
+              than desired. Check pod events.
+
+        - alert: BoutiqueContainerOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{
+              namespace="boutique",
+              reason="OOMKilled"
+            } == 1
+          for: 0m
+          labels:
+            severity: warning
+            service: boutique
+          annotations:
+            summary: "Container OOMKilled in boutique namespace"
+            description: >
+              Container {{ $labels.container }} in pod {{ $labels.pod }} was OOMKilled.
+              Consider increasing memory limits.
+
+        - alert: BoutiqueContainerHighCPU
+          expr: |
+            sum by (pod, container) (
+              rate(container_cpu_usage_seconds_total{namespace="boutique"}[5m])
+            )
+            /
+            sum by (pod, container) (
+              kube_pod_container_resource_limits{namespace="boutique", resource="cpu"}
+            ) > 0.85
+          for: 10m
+          labels:
+            severity: warning
+            service: boutique
+          annotations:
+            summary: "Container CPU usage above 85% of limit"
+            description: >
+              Container {{ $labels.container }} in pod {{ $labels.pod }} is using
+              {{ $value | humanizePercentage }} of its CPU limit for 10+ minutes.
+              HPA may need tuning.
+
+        - alert: BoutiqueRedisDown
+          expr: |
+            kube_deployment_status_replicas_available{
+              namespace="boutique",
+              deployment="redis-cart"
+            } == 0
+          for: 1m
+          labels:
+            severity: critical
+            service: boutique
+          annotations:
+            summary: "Redis cart is down"
+            description: >
+              redis-cart has 0 available replicas. Cart service will fail.
+              All checkout flows are impacted.
