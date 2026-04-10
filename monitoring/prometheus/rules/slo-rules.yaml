@@ -1,0 +1,74 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: boutique-slo-rules
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: boutique.slo.availability
+      interval: 30s
+      rules:
+        - record: boutique:frontend:availability5m
+          expr: |
+            sum(rate(http_requests_total{namespace="boutique", pod=~"frontend.*", code!~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{namespace="boutique", pod=~"frontend.*"}[5m]))
+
+        - alert: FrontendAvailabilityBurnRateFast
+          expr: |
+            (
+              sum(rate(http_requests_total{namespace="boutique", pod=~"frontend.*", code=~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{namespace="boutique", pod=~"frontend.*"}[1h]))
+            ) > (14.4 * 0.005)
+          for: 2m
+          labels:
+            severity: critical
+            team: sre
+          annotations:
+            summary: "Frontend error budget burning fast"
+            description: "Frontend is consuming error budget at 14.4x the allowed rate over the last 1h. SLO: 99.5% availability."
+
+        - alert: FrontendAvailabilityBurnRateSlow
+          expr: |
+            (
+              sum(rate(http_requests_total{namespace="boutique", pod=~"frontend.*", code=~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total{namespace="boutique", pod=~"frontend.*"}[6h]))
+            ) > (6 * 0.005)
+          for: 15m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "Frontend error budget burning slowly"
+            description: "Frontend is consuming error budget at 6x the allowed rate over the last 6h. SLO: 99.5% availability."
+
+    - name: boutique.slo.latency
+      interval: 30s
+      rules:
+        - alert: FrontendHighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{namespace="boutique", pod=~"frontend.*"}[5m])) by (le)
+            ) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "Frontend p99 latency above 500ms"
+            description: "99th percentile latency for frontend is above 500ms SLO threshold."
+
+    - name: boutique.slo.errbudget
+      interval: 30s
+      rules:
+        - record: boutique:frontend:error_budget_remaining
+          expr: |
+            1 - (
+              sum(increase(http_requests_total{namespace="boutique", pod=~"frontend.*", code=~"5.."}[30d]))
+              /
+              sum(increase(http_requests_total{namespace="boutique", pod=~"frontend.*"}[30d]))
+            ) / 0.005
