@@ -46,6 +46,7 @@ The goal is not just to deploy the app, but to **operate it like a production SR
 | Manual kubectl apply to deploy | ArgoCD auto-syncs on every GitHub push |
 | Infrastructure clicked in console | Terraform modules — reproducible, version-controlled |
 | No observability | Prometheus + Grafana SLO dashboards + Jaeger tracing |
+| No alerting | Alertmanager → Slack real-time incident notifications |
 | No chaos testing | LitmusChaos experiments + postmortems *(coming)* |
 
 ---
@@ -82,7 +83,7 @@ EKS Worker Nodes (private subnets, 3x t3.medium)
     │
     ├── boutique namespace (all 10 services + Redis)
     ├── argocd namespace (GitOps controller)
-    └── monitoring namespace (Prometheus, Grafana, Jaeger)
+    └── monitoring namespace (Prometheus, Grafana, Jaeger, Alertmanager)
 
 Supporting services:
     ECR      — container registry (10 repos, one per service)
@@ -141,12 +142,13 @@ Supporting services:
 │       └── terraform.tfvars
 ├── monitoring/
 │   ├── prometheus/
-│   │   ├── servicemonitor.yaml   # tells Prometheus to scrape boutique services
+│   │   ├── servicemonitor.yaml
 │   │   └── rules/
-│   │       └── slo-rules.yaml    # SLO alerting rules + error budget
-│   └── grafana/
-│       └── dashboards/
-│           └── sre-overview.json # exported SRE dashboard
+│   │       └── slo-rules.yaml
+│   ├── grafana/
+│   │   └── dashboards/
+│   │       └── sre-overview.json
+│   └── alertmanager-config.yaml  # Slack notification config
 ├── chaos/                        # coming in Phase 5
 ├── runbooks/                     # coming in Phase 5
 └── load-testing/                 # coming in Phase 5
@@ -209,11 +211,7 @@ kubectl get nodes
 
 ```bash
 kubectl create namespace boutique
-
-helm install boutique ./helm \
-  --namespace boutique \
-  --create-namespace
-
+helm install boutique ./helm --namespace boutique --create-namespace
 kubectl get pods -n boutique
 ```
 
@@ -246,8 +244,6 @@ A single `deployment.yaml` iterates over all services using `{{- range $name, $s
 
 **Security context on every pod**
 
-Every deployment enforces:
-
 ```yaml
 securityContext:
   runAsNonRoot: true
@@ -259,39 +255,27 @@ securityContext:
       - ALL
 ```
 
-No container runs as root. No container can escalate privileges.
+**HPA on all 10 services** — 70% CPU utilisation target, disabled in `values-dev.yaml`.
 
-**HPA on all 10 services**
+**PodDisruptionBudget on all backend services** — `minAvailable: 1` prevents eviction of last running pod.
 
-Horizontal Pod Autoscaler configured for every service with 70% CPU utilisation target. Disabled in `values-dev.yaml` to conserve local resources.
-
-**PodDisruptionBudget on all backend services**
-
-All services except frontend have `minAvailable: 1` — Kubernetes will not evict the last running pod during node drain or rolling updates.
-
-**Frontend as NodePort, all others as ClusterIP**
-
-Only the frontend is exposed externally. All backend services are reachable only within the cluster.
+**Frontend as NodePort, all others as ClusterIP** — all external traffic enters through the frontend only.
 
 ### Debugging a real production issue
 
-During initial deployment the frontend entered `CrashLoopBackOff` while all other 9 services started successfully.
+Frontend entered `CrashLoopBackOff` while all other 9 services started successfully.
 
-**Diagnosis:**
 ```bash
 kubectl logs frontend-xxx -n boutique
 # panic: environment variable "SHOPPING_ASSISTANT_SERVICE_ADDR" not set
 ```
 
-**Root cause:** `v0.10.1` introduced a new required env variable. The app's `mustMapEnv` function panics if any required env var is empty or unset. Setting `value: ""` in `values.yaml` did not work — Kubernetes silently strips empty string values from the env spec entirely.
+`v0.10.1` introduced a new required env variable. Kubernetes silently strips `value: ""` from the env spec. Fix:
 
-**Fix:**
 ```yaml
 - name: SHOPPING_ASSISTANT_SERVICE_ADDR
   value: "shoppingassistantservice:80"
 ```
-
-**Lesson:** Kubernetes silently drops `value: ""` env entries. Always use a non-empty placeholder when a required env var points to an optional or non-existent service.
 
 ---
 
@@ -302,32 +286,18 @@ kubectl logs frontend-xxx -n boutique
 ### How it works
 
 ```
-Push to GitHub (helm/values.yaml)
-        │
-        ▼
-ArgoCD detects drift (polls every 3 min)
-        │
-        ▼
-ArgoCD syncs Helm chart to cluster
-        │
-        ▼
-Cluster reflects GitHub state exactly
+Push to GitHub → ArgoCD detects drift → syncs Helm chart → cluster updated
 ```
-
-GitHub is the single source of truth. Nobody runs `kubectl apply` or `helm upgrade` manually — every change goes through Git.
 
 ### ArgoCD installation
 
 ```bash
 helm repo add argo https://argoproj.github.io/argo-helm
 helm repo update
-
 kubectl create namespace argocd
-
 helm install argocd argo/argo-cd \
   --namespace argocd \
   --set configs.params."server\.insecure"=true
-
 kubectl get pods -n argocd
 ```
 
@@ -361,34 +331,14 @@ spec:
       - ServerSideApply=true
 ```
 
-Key flags:
-- `automated` — ArgoCD polls GitHub every 3 minutes, no manual sync needed
-- `selfHeal: true` — manual cluster changes are reverted to match GitHub
-- `prune: true` — services removed from `values.yaml` are deleted from cluster
-- `CreateNamespace=true` — namespace created automatically if missing
-
-### Apply and access
-
 ```bash
 kubectl apply -f argocd/application.yaml
 kubectl get application -n argocd
 
-# Get admin password
+# Access UI
 kubectl -n argocd get secret argocd-initial-admin-secret \
   -o jsonpath="{.data.password}" | base64 -d && echo
-
-# Port forward UI
 kubectl port-forward svc/argocd-server 8081:80 -n argocd
-```
-
-### GitOps validation
-
-```bash
-# Edit helm/values-dev.yaml → frontend.replicas: 2
-git add . && git commit -m "test: scale frontend to 2 replicas" && git push origin main
-
-# Watch pods — second frontend appears automatically within 3 minutes
-kubectl get pods -n boutique -w
 ```
 
 ---
@@ -396,18 +346,6 @@ kubectl get pods -n boutique -w
 ## Phase 3 — Terraform + AWS EKS
 
 **Status: complete — infrastructure provisioned, app deployed, resources destroyed**
-
-### Overview
-
-The same Helm chart validated on kind is promoted to a real AWS EKS cluster provisioned entirely with Terraform. Three independent modules — vpc, eks, ecr — are called from a single root env config. Remote state in S3 with DynamoDB locking.
-
-### Prerequisites
-
-```bash
-terraform  >= 1.6.0
-aws-cli    >= 2.x
-aws sts get-caller-identity  # verify credentials
-```
 
 ### Step 1 — Create S3 backend and DynamoDB lock table
 
@@ -439,7 +377,7 @@ aws dynamodb create-table \
 
 ### Step 2 — Configure backend.tf
 
-Edit `terraform/envs/prod/backend.tf` — replace `YOUR_ACCOUNT_ID`:
+Replace `YOUR_ACCOUNT_ID` in `terraform/envs/prod/backend.tf`:
 
 ```hcl
 terraform {
@@ -462,7 +400,7 @@ terraform plan -out=tfplan
 terraform apply "tfplan"
 ```
 
-EKS takes 12-15 minutes. Total ~20 minutes. Creates 48 resources.
+Creates 48 resources. EKS takes ~20 minutes total.
 
 ### Step 4 — Connect and deploy
 
@@ -473,7 +411,6 @@ kubectl get nodes -o wide
 kubectl create namespace boutique
 helm install boutique ./helm --namespace boutique -f helm/values.yaml
 
-# Expose frontend via AWS ELB
 kubectl patch svc frontend -n boutique \
   -p '{"spec": {"type": "LoadBalancer"}}'
 kubectl get svc frontend -n boutique
@@ -481,24 +418,21 @@ kubectl get svc frontend -n boutique
 
 Open `http://<EXTERNAL-IP>:8080`
 
-### Teardown — complete cleanup
+### Teardown
 
 ```bash
 helm uninstall boutique -n boutique
 cd terraform/envs/prod && terraform destroy -auto-approve
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
 aws s3api delete-objects \
   --bucket boutique-terraform-state-${ACCOUNT_ID} \
   --delete "$(aws s3api list-object-versions \
     --bucket boutique-terraform-state-${ACCOUNT_ID} \
     --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
     --output json)" --region ap-south-1
-
 aws s3api delete-bucket \
   --bucket boutique-terraform-state-${ACCOUNT_ID} --region ap-south-1
-
 aws dynamodb delete-table \
   --table-name boutique-terraform-locks --region ap-south-1
 ```
@@ -514,15 +448,13 @@ aws dynamodb delete-table \
 ```
 Prometheus      — scrapes metrics from all pods + Kubernetes internals
 Grafana         — dashboards + SLO visualisation (NodePort: 30030)
-Alertmanager    — receives and routes SLO breach alerts
+Alertmanager    — routes alerts to Slack in real time
 kube-state-metrics — cluster-level metrics (pod status, replica counts)
 Node Exporter   — node-level metrics (CPU, memory per node)
 Jaeger          — distributed tracing across gRPC service calls
 ServiceMonitor  — tells Prometheus to scrape boutique namespace
 PrometheusRules — SLO alerting rules + error budget burn rate
 ```
-
-All installed via Helm into the `monitoring` namespace.
 
 ### Prerequisites
 
@@ -533,9 +465,43 @@ helm repo add jaegertracing https://jaegertracing.github.io/helm-charts
 helm repo update
 ```
 
-### Step 1 — Fix inotify limits on kind nodes
+---
 
-This is required before installing any log collectors. kind nodes have low default inotify limits which cause `too many open files` errors:
+### IMPORTANT — After every system restart or power off
+
+kind nodes lose their inotify limits on every restart. This causes monitoring components to crash. **Always run this first after any restart before doing anything else:**
+
+```bash
+# Step 1 — Fix inotify limits on all kind nodes
+for node in $(kubectl get nodes -o name | sed 's/node\///'); do
+  docker exec $node sysctl fs.inotify.max_user_instances=512
+  docker exec $node sysctl fs.inotify.max_user_watches=524288
+done
+```
+
+```bash
+# Step 2 — Restart kube-state-metrics (it always crashes after restart)
+kubectl rollout restart deployment/prometheus-kube-state-metrics -n monitoring
+
+# Step 3 — Verify all monitoring pods are stable
+kubectl get pods -n monitoring
+```
+
+Wait 2 minutes for pods to stabilise. kube-state-metrics may restart 2-3 times — this is normal, it settles on its own.
+
+```bash
+# Step 4 — Get kind node IP (may change after restart)
+kubectl get nodes -o wide | grep worker | head -1 | awk '{print $6}'
+```
+
+Access services at the new node IP:
+- Grafana → `http://<NODE-IP>:30030` (admin / boutique-grafana)
+- Prometheus → `http://<NODE-IP>:<prometheus-nodeport>`
+- Jaeger → `http://<NODE-IP>:<jaeger-nodeport>`
+
+---
+
+### Fresh install — Step 1: Fix inotify limits
 
 ```bash
 for node in $(kubectl get nodes -o name | sed 's/node\///'); do
@@ -544,9 +510,7 @@ for node in $(kubectl get nodes -o name | sed 's/node\///'); do
 done
 ```
 
-**Note:** This must be run again after every system reboot or kind cluster restart — the limits reset on restart.
-
-### Step 2 — Install kube-prometheus-stack
+### Fresh install — Step 2: Install kube-prometheus-stack
 
 ```bash
 kubectl create namespace monitoring
@@ -566,27 +530,17 @@ helm install prometheus prometheus-community/kube-prometheus-stack \
   --set kube-state-metrics.image.tag=v2.13.0
 ```
 
-Wait for all pods:
+Wait for all pods to be `Running`:
 
 ```bash
 kubectl get pods -n monitoring -w
 ```
 
-Expected pods — all `Running`:
-```
-alertmanager-prometheus-kube-prometheus-alertmanager-0   2/2   Running
-prometheus-grafana-xxx                                   3/3   Running
-prometheus-kube-prometheus-operator-xxx                  1/1   Running
-prometheus-kube-state-metrics-xxx                        1/1   Running
-prometheus-prometheus-kube-prometheus-prometheus-0       2/2   Running
-prometheus-prometheus-node-exporter-xxx (x4)             1/1   Running
-```
+**Important notes:**
+- Pin `kube-state-metrics.image.tag=v2.13.0` — v2.18.0 has a liveness probe port mismatch bug causing permanent CrashLoopBackOff
+- The prometheus-operator pod restarts 2-3 times during TLS certificate initialisation — this is normal and settles within 2 minutes
 
-**Note on operator restarts:** The prometheus-operator pod restarts 2-3 times on fresh install due to TLS certificate initialisation. This is normal — it stabilises within 2 minutes.
-
-**Note on kube-state-metrics:** Pin to `v2.13.0` explicitly. v2.18.0 has a liveness probe port mismatch bug where the probe checks port 8081 but the container listens on 8080, causing permanent CrashLoopBackOff.
-
-### Step 3 — Install Jaeger
+### Fresh install — Step 3: Install Jaeger
 
 ```bash
 helm install jaeger jaegertracing/jaeger \
@@ -602,7 +556,7 @@ helm install jaeger jaegertracing/jaeger \
   --wait=false
 ```
 
-### Step 4 — Apply ServiceMonitor and SLO rules
+### Fresh install — Step 4: Apply ServiceMonitor and SLO rules
 
 ```bash
 kubectl apply -f monitoring/prometheus/servicemonitor.yaml
@@ -613,24 +567,18 @@ kubectl get servicemonitor -n monitoring | grep boutique
 kubectl get prometheusrule -n monitoring | grep boutique
 ```
 
-The ServiceMonitor tells Prometheus to scrape all services in the `boutique` namespace. The PrometheusRules define:
-- Availability SLO — 99.5% of frontend requests must succeed
-- Error budget burn rate alert — fires when budget exhausts faster than allowed
-- p99 latency alert — fires when 99th percentile exceeds 500ms
-
-### Step 5 — Expose UIs via NodePort
+### Fresh install — Step 5: Expose UIs via NodePort
 
 ```bash
-# Grafana — already NodePort 30030 from install
 # Get kind node IP
 kubectl get nodes -o wide | grep worker | head -1 | awk '{print $6}'
 
-# Prometheus
+# Prometheus NodePort
 kubectl patch svc prometheus-kube-prometheus-prometheus -n monitoring \
   --type='json' \
   -p='[{"op": "replace", "path": "/spec/type", "value": "NodePort"}]'
 
-# Jaeger
+# Jaeger NodePort
 kubectl patch svc jaeger -n monitoring \
   --type='json' \
   -p='[{"op": "replace", "path": "/spec/type", "value": "NodePort"}]'
@@ -639,67 +587,119 @@ kubectl patch svc jaeger -n monitoring \
 kubectl get svc -n monitoring | grep NodePort
 ```
 
-Access via browser (replace NODE-IP with your kind worker node IP):
-- Grafana → `http://NODE-IP:30030` (admin / boutique-grafana)
-- Prometheus → `http://NODE-IP:<prometheus-nodeport>`
-- Jaeger → `http://NODE-IP:<jaeger-nodeport>`
+---
 
-### Step 6 — SRE Overview dashboard
+### Slack alerting integration
 
-The dashboard `monitoring/grafana/dashboards/sre-overview.json` is committed to the repo and contains 8 panels:
+Alertmanager is configured to send real-time alerts to Slack. This proves the full alerting pipeline — Prometheus detects an issue → Alertmanager routes it → Slack receives it.
 
-| Panel | Query | Type |
-|---|---|---|
-| CPU usage by pod | `sum(rate(container_cpu_usage_seconds_total{namespace="boutique"}[5m])) by (pod)` | Time series |
-| Memory usage by pod | `sum(container_memory_working_set_bytes{namespace="boutique", container!=""}) by (pod)` | Time series |
-| Healthy pods | `count(kube_pod_status_ready{namespace="boutique", condition="true"})` | Stat |
-| Network receive rate | `sum(rate(container_network_receive_bytes_total{namespace="boutique"}[5m])) by (pod)` | Time series |
-| Network transmit rate | `sum(rate(container_network_transmit_bytes_total{namespace="boutique"}[5m])) by (pod)` | Time series |
-| Node CPU usage | `sum(rate(node_cpu_seconds_total{mode!="idle"}[5m])) by (instance)` | Time series |
-| Node memory usage | `sum(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) by (instance)` | Time series |
-| Pod restart count | `sum(kube_pod_container_status_restarts_total{namespace="boutique"}) by (pod)` | Time series |
+**Step 1 — Create a Slack workspace and incoming webhook:**
 
-To import the dashboard in Grafana: Dashboards → Import → Upload JSON file → select `monitoring/grafana/dashboards/sre-overview.json`.
+1. Go to `https://slack.com/get-started` and create a free workspace
+2. Create a channel called `#alerts`
+3. Go to `https://api.slack.com/apps` → **Create New App** → **From scratch**
+4. App name: `AlertManager` → select your workspace → **Create App**
+5. Click **Incoming Webhooks** → toggle **Activate Incoming Webhooks** ON
+6. Click **Add New Webhook to Workspace** → select `#alerts` → **Allow**
+7. Copy the webhook URL (format: `https://hooks.slack.com/services/T.../B.../xxx`)
 
-### Observability design decisions
+**Step 2 — Apply Alertmanager config:**
 
-**kube-prometheus-stack over individual installs**
+Edit `monitoring/alertmanager-config.yaml` and replace the `slack_api_url` with your webhook URL:
 
-Installing Prometheus, Grafana, and Alertmanager separately requires manual wiring. The `kube-prometheus-stack` Helm chart bundles all three with pre-configured scrape configs, recording rules, and dashboards. This is the production standard — it's what most companies run.
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-prometheus-kube-prometheus-alertmanager
+  namespace: monitoring
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+      slack_api_url: 'YOUR_SLACK_WEBHOOK_URL'
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: 'slack-alerts'
+    receivers:
+      - name: 'slack-alerts'
+        slack_configs:
+          - channel: '#alerts'
+            send_resolved: true
+            title: '{{ if eq .Status "firing" }}🔥 FIRING{{ else }}✅ RESOLVED{{ end }} | {{ .CommonLabels.alertname }}'
+            text: |
+              *Severity:* {{ .CommonLabels.severity }}
+              *Namespace:* {{ .CommonLabels.namespace }}
+              {{ range .Alerts }}
+              *Summary:* {{ .Annotations.summary }}
+              *Description:* {{ .Annotations.description }}
+              {{ end }}
+```
 
-**ServiceMonitor over static scrape configs**
+```bash
+kubectl apply -f monitoring/alertmanager-config.yaml
 
-Rather than hardcoding scrape targets in `prometheus.yaml`, a `ServiceMonitor` CRD dynamically tells Prometheus which services to scrape using label selectors. Adding a new service to the boutique namespace automatically gets scraped — no Prometheus config changes needed.
+kubectl rollout restart statefulset/alertmanager-prometheus-kube-prometheus-alertmanager -n monitoring
+```
 
-**Error budget burn rate alerting**
+**Step 3 — Send a test alert to verify:**
 
-Two alerts are configured — a fast burn rate (14.4x over 1 hour) that fires immediately for critical incidents, and a slow burn rate (6x over 6 hours) for gradual degradation. This is the Google SRE book's recommended alerting model for SLOs.
+```bash
+ALERTMANAGER_POD=$(kubectl get pod -n monitoring -l app.kubernetes.io/name=alertmanager -o jsonpath='{.items[0].metadata.name}')
 
-**Jaeger all-in-one with in-memory storage**
+kubectl exec -n monitoring $ALERTMANAGER_POD -c alertmanager -- wget -qO- \
+  --post-data='[{"labels":{"alertname":"TestAlert","severity":"critical","namespace":"boutique"},"annotations":{"summary":"Test alert from Alertmanager","description":"This is a test to verify Slack integration is working"}}]' \
+  --header='Content-Type: application/json' \
+  http://localhost:9093/api/v2/alerts
+```
 
-For local development, Jaeger runs in all-in-one mode with in-memory storage — no Cassandra or Elasticsearch needed. Traces are lost on pod restart which is acceptable locally. Production would use persistent storage.
+Check `#alerts` in Slack — you should see the alert appear within 30 seconds.
 
-**NodePort over port-forward for local access**
+**Alerts that fire automatically on kind (expected):**
+- `Watchdog` — always firing, proves alerting pipeline works
+- `etcdMembersDown` / `etcdInsufficientMembers` — kind uses single etcd member, Prometheus expects 3. False positive on kind, not an issue on EKS
+- `TargetDown` (kube-proxy, kube-controller-manager) — kind doesn't expose these endpoints. Normal for kind
 
-Port-forwarding breaks on system sleep/restart. NodePort assignments persist as long as the kind cluster runs — Grafana, Prometheus, and Jaeger are always accessible at fixed addresses without any manual commands.
+---
+
+### SRE Overview dashboard
+
+Import `monitoring/grafana/dashboards/sre-overview.json` in Grafana:
+Dashboards → Import → Upload JSON file
+
+8 panels covering app and infrastructure:
+
+| Panel | Metric source |
+|---|---|
+| CPU usage by pod | cAdvisor |
+| Memory usage by pod | cAdvisor |
+| Healthy pods | kube-state-metrics |
+| Network receive rate | cAdvisor |
+| Network transmit rate | cAdvisor |
+| Node CPU usage | node-exporter |
+| Node memory usage | node-exporter |
+| Pod restart count | kube-state-metrics |
+
+**Note:** Set time range to **Last 1 hour** — after a restart Prometheus has no data for the last 5 minutes window.
+
+---
 
 ### Debugging encountered during Phase 4
 
 **Issue 1 — Promtail `too many open files`**
-
-Promtail crashed on all nodes with `failed to make file target manager: too many open files`. Root cause: kind nodes default to very low inotify limits (128 instances, 8192 watches). Promtail watches log files for every pod which exhausts these limits quickly.
-
-Fix: increase inotify limits on all kind nodes via `docker exec` before installing any log collectors.
+kind nodes default to very low inotify limits. Fix: increase limits via `docker exec` before installing any log collectors. Must be rerun after every restart.
 
 **Issue 2 — kube-state-metrics liveness probe port mismatch**
-
-kube-state-metrics v2.18.0 changed its health check port but the kube-prometheus-stack Helm chart's probe was still pointing to the old port. Result: permanent CrashLoopBackOff with `connection refused` on the readiness probe.
-
-Fix: pin `kube-state-metrics.image.tag=v2.13.0` which uses the port the chart's probe expects.
+v2.18.0 changed its health port but the Helm chart probe still pointed to the old port. Fix: pin `kube-state-metrics.image.tag=v2.13.0`.
 
 **Issue 3 — Grafana datasource conflict**
+Provisioning Loki via ConfigMap failed because kube-prometheus-stack already marks Prometheus as the default datasource. Fix: add additional datasources through Grafana UI directly.
 
-Attempting to provision Loki as a datasource via ConfigMap failed with `Only one datasource per organization can be marked as default` because kube-prometheus-stack already provisions Prometheus as the default. Fix: add additional datasources through the Grafana UI directly rather than via ConfigMap provisioning.
+**Issue 4 — Prometheus x509 certificate error scraping boutique namespace**
+After kind cluster restart, Prometheus could not scrape boutique services due to TLS certificate verification failure. Fix: add `tlsConfig.insecureSkipVerify: true` to the ServiceMonitor.
 
 ---
 
@@ -710,7 +710,7 @@ Attempting to provision Loki as a datasource via ConfigMap failed with `Only one
 | Phase 1 — Helm chart | ✅ Complete | Single Helm chart for all 10 services, validated on kind |
 | Phase 2 — GitOps with ArgoCD | ✅ Complete | ArgoCD watching GitHub, auto-sync with self-healing on every push |
 | Phase 3 — Terraform + AWS EKS | ✅ Complete | Modular Terraform, EKS cluster, same Helm chart promoted to AWS |
-| Phase 4 — Observability | ✅ Complete | Prometheus + Grafana SRE dashboard + Jaeger + SLO alerting rules |
+| Phase 4 — Observability | ✅ Complete | Prometheus + Grafana + Jaeger + Alertmanager → Slack alerts |
 | Phase 5 — Chaos engineering | 🔄 In progress | LitmusChaos experiments, k6 load tests, postmortems, runbooks |
 
 ---
@@ -725,7 +725,7 @@ Attempting to provision Loki as a datasource via ConfigMap failed with `Only one
 | Infrastructure as code | Terraform (AWS provider) |
 | CI/CD | GitHub Actions *(coming)* |
 | Metrics | Prometheus + Grafana |
-| Alerting | Alertmanager + PrometheusRules |
+| Alerting | Alertmanager + Slack |
 | Tracing | Jaeger |
 | Chaos engineering | LitmusChaos *(coming)* |
 | Load testing | k6 *(coming)* |
