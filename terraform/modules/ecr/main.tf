@@ -36,7 +36,8 @@ resource "aws_ecr_lifecycle_policy" "services" {
       }
     }]
   })
-}terraform {
+}
+terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
