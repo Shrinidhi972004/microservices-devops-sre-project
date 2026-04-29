@@ -7,10 +7,6 @@ on:
       - 'helm/**'
   workflow_dispatch:
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_PREFIX: ghcr.io/shrinidhi972004/boutique
-
 jobs:
   scan-and-push:
     name: Scan and push ${{ matrix.service }}
@@ -51,7 +47,7 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -73,7 +69,7 @@ jobs:
           name: trivy-${{ matrix.service }}
           path: trivy-${{ matrix.service }}.txt
 
-- name: Tag and push to GHCR
+      - name: Tag and push to GHCR
         run: |
           IMAGE="ghcr.io/shrinidhi972004/boutique/${{ matrix.service }}"
           docker tag ${{ matrix.upstream }} ${IMAGE}:${{ github.sha }}
