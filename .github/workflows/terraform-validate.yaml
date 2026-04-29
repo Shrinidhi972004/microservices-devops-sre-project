@@ -1,0 +1,45 @@
+name: Terraform Validate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+
+jobs:
+  terraform-validate:
+    name: Validate Terraform modules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Validate VPC module
+        run: |
+          cd terraform/modules/vpc
+          terraform init -backend=false
+          terraform validate
+
+      - name: Validate EKS module
+        run: |
+          cd terraform/modules/eks
+          terraform init -backend=false
+          terraform validate
+
+      - name: Validate ECR module
+        run: |
+          cd terraform/modules/ecr
+          terraform init -backend=false
+          terraform validate
