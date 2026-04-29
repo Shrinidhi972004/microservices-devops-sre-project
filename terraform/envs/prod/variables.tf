@@ -61,7 +61,7 @@ variable "node_max_size" {
 variable "services" {
   description = "List of microservices for ECR repos"
   type        = list(string)
-  default     = [
+  default = [
     "frontend",
     "cartservice",
     "productcatalogservice",
