@@ -23,6 +23,7 @@ This is the difference between knowing how to use a tool and knowing how to engi
 - [Phase 2 — GitOps with ArgoCD](#phase-2--gitops-with-argocd)
 - [Phase 3 — Terraform + AWS EKS](#phase-3--terraform--aws-eks)
 - [Phase 4 — Observability](#phase-4--observability)
+- [Phase 5 — CI/CD with GitHub Actions](#phase-5--cicd-with-github-actions)
 - [Roadmap](#roadmap)
 - [Tech stack](#tech-stack)
 
@@ -47,6 +48,7 @@ The goal is not just to deploy the app, but to **operate it like a production SR
 | Infrastructure clicked in console | Terraform modules — reproducible, version-controlled |
 | No observability | Prometheus + Grafana SLO dashboards + Jaeger tracing |
 | No alerting | Alertmanager → Slack real-time incident notifications |
+| No CI pipeline | GitHub Actions — lint, validate, Trivy scan, GHCR push |
 | No chaos testing | LitmusChaos experiments + postmortems *(coming)* |
 
 ---
@@ -87,6 +89,7 @@ EKS Worker Nodes (private subnets, 3x t3.medium)
 
 Supporting services:
     ECR      — container registry (10 repos, one per service)
+    GHCR     — GitHub Container Registry (CI-built images)
     S3       — Terraform remote state
     DynamoDB — Terraform state locking
     NAT GW   — private subnet egress
@@ -148,10 +151,15 @@ Supporting services:
 │   ├── grafana/
 │   │   └── dashboards/
 │   │       └── sre-overview.json
-│   └── alertmanager-config.yaml  # Slack notification config
-├── chaos/                        # coming in Phase 5
-├── runbooks/                     # coming in Phase 5
-└── load-testing/                 # coming in Phase 5
+│   └── alertmanager-config.yaml  # Slack config — DO NOT COMMIT real webhook URL
+├── .github/
+│   └── workflows/
+│       ├── helm-lint.yaml         # Helm chart linting
+│       ├── terraform-validate.yaml # Terraform fmt + validate
+│       └── image-scan-push.yaml   # Trivy scan + GHCR push for all 10 services
+├── chaos/                        # coming in Phase 6
+├── runbooks/                     # coming in Phase 6
+└── load-testing/                 # coming in Phase 6
 ```
 
 ### Everything deleted from upstream and why
@@ -163,10 +171,10 @@ Supporting services:
 | `terraform/` | Targets GCP, not AWS | `terraform/` — AWS EKS modules |
 | `kustomize/` | Redundant — Helm handles env overlays | `values-dev.yaml`, `values-prod.yaml` |
 | `istio-manifests/` | GCP service mesh, not used | NetworkPolicies in Helm instead |
-| `.github/` | GCP Cloud Build workflows | `.github/workflows/` — GitHub Actions *(coming)* |
+| `.github/` | GCP Cloud Build workflows | `.github/workflows/` — GitHub Actions CI |
 | `skaffold.yaml` | GCP-specific dev tool | Replaced by Helm + ArgoCD GitOps |
 | `loadgenerator/` | Black box Locust container | `load-testing/` — custom k6 scenarios *(coming)* |
-| `cloudbuild.yaml` | GCP Cloud Build | GitHub Actions CI pipeline *(coming)* |
+| `cloudbuild.yaml` | GCP Cloud Build | GitHub Actions CI pipeline |
 | `docs/` | GCP deployment guides | This README |
 | `.deploystack/` | GCP-specific tooling | Not needed |
 
@@ -469,7 +477,7 @@ helm repo update
 
 ### IMPORTANT — After every system restart or power off
 
-kind nodes lose their inotify limits on every restart. This causes monitoring components to crash. **Always run this first after any restart before doing anything else:**
+kind nodes lose their inotify limits on every restart. **Always run this first after any restart:**
 
 ```bash
 # Step 1 — Fix inotify limits on all kind nodes
@@ -477,19 +485,13 @@ for node in $(kubectl get nodes -o name | sed 's/node\///'); do
   docker exec $node sysctl fs.inotify.max_user_instances=512
   docker exec $node sysctl fs.inotify.max_user_watches=524288
 done
-```
 
-```bash
-# Step 2 — Restart kube-state-metrics (it always crashes after restart)
+# Step 2 — Restart kube-state-metrics
 kubectl rollout restart deployment/prometheus-kube-state-metrics -n monitoring
 
-# Step 3 — Verify all monitoring pods are stable
+# Step 3 — Verify pods are stable
 kubectl get pods -n monitoring
-```
 
-Wait 2 minutes for pods to stabilise. kube-state-metrics may restart 2-3 times — this is normal, it settles on its own.
-
-```bash
 # Step 4 — Get kind node IP (may change after restart)
 kubectl get nodes -o wide | grep worker | head -1 | awk '{print $6}'
 ```
@@ -528,17 +530,13 @@ helm install prometheus prometheus-community/kube-prometheus-stack \
   --set nodeExporter.enabled=true \
   --set kubeStateMetrics.enabled=true \
   --set kube-state-metrics.image.tag=v2.13.0
-```
 
-Wait for all pods to be `Running`:
-
-```bash
 kubectl get pods -n monitoring -w
 ```
 
 **Important notes:**
-- Pin `kube-state-metrics.image.tag=v2.13.0` — v2.18.0 has a liveness probe port mismatch bug causing permanent CrashLoopBackOff
-- The prometheus-operator pod restarts 2-3 times during TLS certificate initialisation — this is normal and settles within 2 minutes
+- Pin `kube-state-metrics.image.tag=v2.13.0` — v2.18.0 has a liveness probe port mismatch bug
+- The prometheus-operator pod restarts 2-3 times during TLS initialisation — normal, settles in 2 minutes
 
 ### Fresh install — Step 3: Install Jaeger
 
@@ -562,7 +560,6 @@ helm install jaeger jaegertracing/jaeger \
 kubectl apply -f monitoring/prometheus/servicemonitor.yaml
 kubectl apply -f monitoring/prometheus/rules/slo-rules.yaml
 
-# Verify
 kubectl get servicemonitor -n monitoring | grep boutique
 kubectl get prometheusrule -n monitoring | grep boutique
 ```
@@ -570,107 +567,58 @@ kubectl get prometheusrule -n monitoring | grep boutique
 ### Fresh install — Step 5: Expose UIs via NodePort
 
 ```bash
-# Get kind node IP
 kubectl get nodes -o wide | grep worker | head -1 | awk '{print $6}'
 
-# Prometheus NodePort
 kubectl patch svc prometheus-kube-prometheus-prometheus -n monitoring \
   --type='json' \
   -p='[{"op": "replace", "path": "/spec/type", "value": "NodePort"}]'
 
-# Jaeger NodePort
 kubectl patch svc jaeger -n monitoring \
   --type='json' \
   -p='[{"op": "replace", "path": "/spec/type", "value": "NodePort"}]'
 
-# Get assigned ports
 kubectl get svc -n monitoring | grep NodePort
 ```
 
----
-
 ### Slack alerting integration
 
-Alertmanager is configured to send real-time alerts to Slack. This proves the full alerting pipeline — Prometheus detects an issue → Alertmanager routes it → Slack receives it.
+**Step 1 — Create Slack webhook:**
 
-**Step 1 — Create a Slack workspace and incoming webhook:**
-
-1. Go to `https://slack.com/get-started` and create a free workspace
-2. Create a channel called `#alerts`
+1. Go to `https://slack.com/get-started` → create free workspace
+2. Create channel `#alerts`
 3. Go to `https://api.slack.com/apps` → **Create New App** → **From scratch**
-4. App name: `AlertManager` → select your workspace → **Create App**
-5. Click **Incoming Webhooks** → toggle **Activate Incoming Webhooks** ON
-6. Click **Add New Webhook to Workspace** → select `#alerts` → **Allow**
-7. Copy the webhook URL (format: `https://hooks.slack.com/services/T.../B.../xxx`)
+4. App name: `AlertManager` → select workspace → **Create App**
+5. **Incoming Webhooks** → toggle ON → **Add New Webhook to Workspace** → select `#alerts` → **Allow**
+6. Copy webhook URL: `https://hooks.slack.com/services/T.../B.../xxx`
 
-**Step 2 — Apply Alertmanager config:**
-
-Edit `monitoring/alertmanager-config.yaml` and replace the `slack_api_url` with your webhook URL:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: alertmanager-prometheus-kube-prometheus-alertmanager
-  namespace: monitoring
-stringData:
-  alertmanager.yaml: |
-    global:
-      resolve_timeout: 5m
-      slack_api_url: 'YOUR_SLACK_WEBHOOK_URL'
-    route:
-      group_by: ['alertname', 'namespace']
-      group_wait: 30s
-      group_interval: 5m
-      repeat_interval: 12h
-      receiver: 'slack-alerts'
-    receivers:
-      - name: 'slack-alerts'
-        slack_configs:
-          - channel: '#alerts'
-            send_resolved: true
-            title: '{{ if eq .Status "firing" }}🔥 FIRING{{ else }}✅ RESOLVED{{ end }} | {{ .CommonLabels.alertname }}'
-            text: |
-              *Severity:* {{ .CommonLabels.severity }}
-              *Namespace:* {{ .CommonLabels.namespace }}
-              {{ range .Alerts }}
-              *Summary:* {{ .Annotations.summary }}
-              *Description:* {{ .Annotations.description }}
-              {{ end }}
-```
+**Step 2 — Apply config (never commit real webhook URL to git):**
 
 ```bash
+# Edit monitoring/alertmanager-config.yaml
+# Replace YOUR_SLACK_WEBHOOK_URL with your actual webhook URL
 kubectl apply -f monitoring/alertmanager-config.yaml
-
 kubectl rollout restart statefulset/alertmanager-prometheus-kube-prometheus-alertmanager -n monitoring
 ```
 
-**Step 3 — Send a test alert to verify:**
+**Step 3 — Test alert:**
 
 ```bash
-ALERTMANAGER_POD=$(kubectl get pod -n monitoring -l app.kubernetes.io/name=alertmanager -o jsonpath='{.items[0].metadata.name}')
+ALERTMANAGER_POD=$(kubectl get pod -n monitoring \
+  -l app.kubernetes.io/name=alertmanager \
+  -o jsonpath='{.items[0].metadata.name}')
 
 kubectl exec -n monitoring $ALERTMANAGER_POD -c alertmanager -- wget -qO- \
-  --post-data='[{"labels":{"alertname":"TestAlert","severity":"critical","namespace":"boutique"},"annotations":{"summary":"Test alert from Alertmanager","description":"This is a test to verify Slack integration is working"}}]' \
+  --post-data='[{"labels":{"alertname":"TestAlert","severity":"critical","namespace":"boutique"},"annotations":{"summary":"Test alert from Alertmanager","description":"Slack integration verified"}}]' \
   --header='Content-Type: application/json' \
   http://localhost:9093/api/v2/alerts
 ```
 
-Check `#alerts` in Slack — you should see the alert appear within 30 seconds.
-
-**Alerts that fire automatically on kind (expected):**
-- `Watchdog` — always firing, proves alerting pipeline works
-- `etcdMembersDown` / `etcdInsufficientMembers` — kind uses single etcd member, Prometheus expects 3. False positive on kind, not an issue on EKS
-- `TargetDown` (kube-proxy, kube-controller-manager) — kind doesn't expose these endpoints. Normal for kind
-
----
+Check `#alerts` in Slack — alert appears within 30 seconds.
 
 ### SRE Overview dashboard
 
-Import `monitoring/grafana/dashboards/sre-overview.json` in Grafana:
+Import `monitoring/grafana/dashboards/sre-overview.json`:
 Dashboards → Import → Upload JSON file
-
-8 panels covering app and infrastructure:
 
 | Panel | Metric source |
 |---|---|
@@ -683,23 +631,83 @@ Dashboards → Import → Upload JSON file
 | Node memory usage | node-exporter |
 | Pod restart count | kube-state-metrics |
 
-**Note:** Set time range to **Last 1 hour** — after a restart Prometheus has no data for the last 5 minutes window.
+### Debugging encountered during Phase 4
+
+**Issue 1 — Promtail `too many open files`:** kind nodes have low inotify limits. Fix: increase via `docker exec` before installing log collectors. Rerun after every restart.
+
+**Issue 2 — kube-state-metrics CrashLoopBackOff:** v2.18.0 liveness probe port mismatch. Fix: pin to `v2.13.0`.
+
+**Issue 3 — Grafana datasource conflict:** Loki ConfigMap provisioning failed — kube-prometheus-stack already marks Prometheus as default. Fix: add datasources via Grafana UI.
+
+**Issue 4 — Prometheus x509 error:** After restart, Prometheus TLS verification failed scraping boutique namespace. Fix: `tlsConfig.insecureSkipVerify: true` in ServiceMonitor.
 
 ---
 
-### Debugging encountered during Phase 4
+## Phase 5 — CI/CD with GitHub Actions
 
-**Issue 1 — Promtail `too many open files`**
-kind nodes default to very low inotify limits. Fix: increase limits via `docker exec` before installing any log collectors. Must be rerun after every restart.
+**Status: complete — all 3 pipelines passing**
 
-**Issue 2 — kube-state-metrics liveness probe port mismatch**
-v2.18.0 changed its health port but the Helm chart probe still pointed to the old port. Fix: pin `kube-state-metrics.image.tag=v2.13.0`.
+### Pipeline overview
 
-**Issue 3 — Grafana datasource conflict**
-Provisioning Loki via ConfigMap failed because kube-prometheus-stack already marks Prometheus as the default datasource. Fix: add additional datasources through Grafana UI directly.
+```
+Push to main
+      │
+      ├── helm/** changed → Helm Lint workflow
+      │     └── helm lint + helm template dry run
+      │
+      ├── terraform/** changed → Terraform Validate workflow
+      │     └── terraform fmt check + validate all 3 modules
+      │
+      └── helm/** changed → Image Scan and Push workflow
+            ├── Pull upstream image from Google registry
+            ├── Trivy security scan (CRITICAL + HIGH CVEs)
+            ├── Upload scan results as GitHub artifacts
+            └── Tag + push to GHCR (ghcr.io/shrinidhi972004/boutique/)
+```
 
-**Issue 4 — Prometheus x509 certificate error scraping boutique namespace**
-After kind cluster restart, Prometheus could not scrape boutique services due to TLS certificate verification failure. Fix: add `tlsConfig.insecureSkipVerify: true` to the ServiceMonitor.
+Every commit that touches `helm/` or `terraform/` automatically triggers the relevant pipeline. No manual steps.
+
+### Workflow 1 — Helm Lint (`.github/workflows/helm-lint.yaml`)
+
+Triggers on any change to `helm/**`. Runs:
+- `helm lint ./helm` — validates chart structure and values
+- `helm template` dry run — ensures all 10 services render correctly
+- Counts rendered resource types to verify nothing is missing
+
+### Workflow 2 — Terraform Validate (`.github/workflows/terraform-validate.yaml`)
+
+Triggers on any change to `terraform/**`. Runs:
+- `terraform fmt -check -recursive` — enforces consistent formatting
+- `terraform init -backend=false` + `terraform validate` on each of the 3 modules (vpc, eks, ecr) independently
+
+**Important:** Use Terraform `>= 1.9.0` in CI. Older versions use an expired OpenPGP key for the AWS provider that causes `error checking signature: openpgp: key expired` in GitHub Actions runners.
+
+### Workflow 3 — Image Scan and Push (`.github/workflows/image-scan-push.yaml`)
+
+Triggers on any change to `helm/**` or manually via `workflow_dispatch`. Runs a matrix of 10 parallel jobs — one per service:
+
+- Pulls upstream image from `gcr.io/google-samples/microservices-demo/`
+- Scans with Trivy for CRITICAL and HIGH CVEs
+- Uploads scan report as a downloadable GitHub artifact
+- Tags and pushes to GHCR: `ghcr.io/shrinidhi972004/boutique/<service>:latest`
+
+All 10 images are available at:
+```
+ghcr.io/shrinidhi972004/boutique/frontend:latest
+ghcr.io/shrinidhi972004/boutique/cartservice:latest
+ghcr.io/shrinidhi972004/boutique/checkoutservice:latest
+... (10 total)
+```
+
+### Debugging encountered during Phase 5
+
+**Issue 1 — Terraform OpenPGP key expired:** GitHub Actions runners had an expired HashiCorp signing key causing provider installation to fail. Fix: upgrade to `terraform_version: 1.9.0` in the workflow which ships with an updated key.
+
+**Issue 2 — Terraform fmt check failure:** Our Terraform files weren't consistently formatted. Fix: run `terraform fmt -recursive terraform/` locally and commit the changes before the fmt check passes in CI.
+
+**Issue 3 — GHCR image push failed with invalid reference:** GitHub's `${{ github.repository_owner }}` variable preserves original casing (`Shrinidhi972004`) but GHCR requires all lowercase. Fix: use a shell variable with hardcoded lowercase path instead of the GitHub context variable.
+
+**Issue 4 — Slack webhook URL blocked by GitHub push protection:** Committed the real Slack webhook URL to `alertmanager-config.yaml` — GitHub's secret scanning blocked the push. Fix: use `git filter-branch` to rewrite history removing the file, then use a placeholder `YOUR_SLACK_WEBHOOK_URL` going forward. Add `monitoring/alertmanager-config.yaml` to `.gitignore`.
 
 ---
 
@@ -711,7 +719,8 @@ After kind cluster restart, Prometheus could not scrape boutique services due to
 | Phase 2 — GitOps with ArgoCD | ✅ Complete | ArgoCD watching GitHub, auto-sync with self-healing on every push |
 | Phase 3 — Terraform + AWS EKS | ✅ Complete | Modular Terraform, EKS cluster, same Helm chart promoted to AWS |
 | Phase 4 — Observability | ✅ Complete | Prometheus + Grafana + Jaeger + Alertmanager → Slack alerts |
-| Phase 5 — Chaos engineering | 🔄 In progress | LitmusChaos experiments, k6 load tests, postmortems, runbooks |
+| Phase 5 — CI/CD | ✅ Complete | GitHub Actions — Helm lint, Terraform validate, Trivy scan, GHCR push |
+| Phase 6 — Chaos engineering | 🔄 In progress | LitmusChaos experiments on EKS, k6 load tests, postmortems, runbooks |
 
 ---
 
@@ -723,7 +732,9 @@ After kind cluster restart, Prometheus could not scrape boutique services due to
 | Package management | Helm 3 |
 | GitOps | ArgoCD |
 | Infrastructure as code | Terraform (AWS provider) |
-| CI/CD | GitHub Actions *(coming)* |
+| CI/CD | GitHub Actions |
+| Image registry | GitHub Container Registry (GHCR) |
+| Security scanning | Trivy |
 | Metrics | Prometheus + Grafana |
 | Alerting | Alertmanager + Slack |
 | Tracing | Jaeger |
