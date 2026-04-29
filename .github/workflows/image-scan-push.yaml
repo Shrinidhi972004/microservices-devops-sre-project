@@ -73,17 +73,15 @@ jobs:
           name: trivy-${{ matrix.service }}
           path: trivy-${{ matrix.service }}.txt
 
-      - name: Tag and push to GHCR
+- name: Tag and push to GHCR
         run: |
-          docker tag ${{ matrix.upstream }} \
-            ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
-          docker tag ${{ matrix.upstream }} \
-            ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:latest
-          docker push ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
-          docker push ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:latest
+          IMAGE="ghcr.io/shrinidhi972004/boutique/${{ matrix.service }}"
+          docker tag ${{ matrix.upstream }} ${IMAGE}:${{ github.sha }}
+          docker tag ${{ matrix.upstream }} ${IMAGE}:latest
+          docker push ${IMAGE}:${{ github.sha }}
+          docker push ${IMAGE}:latest
 
       - name: Print image digest
         run: |
-          docker inspect \
-            ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:latest \
-            --format='{{index .RepoDigests 0}}'
+          IMAGE="ghcr.io/shrinidhi972004/boutique/${{ matrix.service }}"
+          docker inspect ${IMAGE}:latest --format='{{index .RepoDigests 0}}'
