@@ -36,4 +36,11 @@ resource "aws_ecr_lifecycle_policy" "services" {
       }
     }]
   })
+}terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }

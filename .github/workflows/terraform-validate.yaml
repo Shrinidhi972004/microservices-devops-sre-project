@@ -29,17 +29,20 @@ jobs:
       - name: Validate VPC module
         run: |
           cd terraform/modules/vpc
-          terraform init -backend=false
+          terraform init -backend=false -upgrade
           terraform validate
 
       - name: Validate EKS module
         run: |
           cd terraform/modules/eks
-          terraform init -backend=false
+          terraform init -backend=false -upgrade
           terraform validate
 
       - name: Validate ECR module
         run: |
           cd terraform/modules/ecr
-          terraform init -backend=false
+          terraform init -backend=false -upgrade
           terraform validate
+        env:
+          TF_CLI_ARGS_init: "-upgrade"
+          AWS_DEFAULT_REGION: ap-south-1

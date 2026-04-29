@@ -163,4 +163,11 @@ resource "aws_eks_node_group" "main" {
   tags = {
     Name = "${var.cluster_name}-nodes"
   }
+}terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }
