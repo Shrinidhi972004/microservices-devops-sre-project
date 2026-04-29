@@ -163,7 +163,9 @@ resource "aws_eks_node_group" "main" {
   tags = {
     Name = "${var.cluster_name}-nodes"
   }
-}terraform {
+}
+
+terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
