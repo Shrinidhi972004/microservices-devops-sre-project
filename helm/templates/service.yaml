@@ -7,13 +7,13 @@ metadata:
     {{- include "online-boutique.labels" $ | nindent 4 }}
     app.kubernetes.io/name: {{ $name }}
 spec:
-  type: {{ if eq $name "frontend" }}NodePort{{ else }}ClusterIP{{ end }}
+  type: {{ if eq $name "frontend" }}{{ default "NodePort" $svc.serviceType }}{{ else }}ClusterIP{{ end }}
   selector:
     app: {{ $name }}
   ports:
     - port: {{ $svc.port }}
       targetPort: {{ $svc.port }}
-      {{- if eq $name "frontend" }}
+      {{- if and (eq $name "frontend") (ne (default "NodePort" $svc.serviceType) "LoadBalancer") }}
       nodePort: 30080
       {{- end }}
 ---

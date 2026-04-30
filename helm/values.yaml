@@ -7,6 +7,7 @@ services:
     tag: v0.10.1
     replicas: 1
     port: 8080
+    serviceType: LoadBalancer
     env:
       - name: SHOPPING_ASSISTANT_SERVICE_ADDR
         value: "shoppingassistantservice:80"
