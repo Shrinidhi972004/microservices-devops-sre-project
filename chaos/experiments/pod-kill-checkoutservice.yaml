@@ -1,0 +1,39 @@
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: checkout-pod-kill
+  namespace: boutique
+spec:
+  appinfo:
+    appns: boutique
+    applabel: app=checkoutservice
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-delete
+      spec:
+        components:
+          env:
+            - name: TOTAL_CHAOS_DURATION
+              value: "30"
+            - name: CHAOS_INTERVAL
+              value: "10"
+            - name: FORCE
+              value: "false"
+            - name: PODS_AFFECTED_PERC
+              value: "100"
+        probe:
+          - name: checkout-availability
+            type: httpProbe
+            httpProbe/inputs:
+              url: http://frontend.boutique.svc.cluster.local:8080/
+              insecureSkipVerify: false
+              method:
+                get:
+                  criteria: ==
+                  responseCode: "200"
+            mode: Continuous
+            runProperties:
+              probeTimeout: 5
+              interval: 5
+              retry: 3
