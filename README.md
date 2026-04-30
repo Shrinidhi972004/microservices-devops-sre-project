@@ -24,6 +24,7 @@ This is the difference between knowing how to use a tool and knowing how to engi
 - [Phase 3 — Terraform + AWS EKS](#phase-3--terraform--aws-eks)
 - [Phase 4 — Observability](#phase-4--observability)
 - [Phase 5 — CI/CD with GitHub Actions](#phase-5--cicd-with-github-actions)
+- [Phase 6 — Full EKS Production Deployment](#phase-6--full-eks-production-deployment)
 - [Roadmap](#roadmap)
 - [Tech stack](#tech-stack)
 
@@ -49,11 +50,12 @@ The goal is not just to deploy the app, but to **operate it like a production SR
 | No observability | Prometheus + Grafana SLO dashboards + Jaeger tracing |
 | No alerting | Alertmanager → Slack real-time incident notifications |
 | No CI pipeline | GitHub Actions — lint, validate, Trivy scan, GHCR push |
-| No chaos testing | LitmusChaos experiments + postmortems *(coming)* |
 
 ---
 
 ## Architecture
+
+![Architecture Diagram](microservices-architecture.png)
 
 The application is Google's Online Boutique — an e-commerce storefront with 10 backend microservices and a Redis cart store.
 
@@ -70,30 +72,6 @@ User → frontend (Go, HTTP)
                   ├── paymentservice (Node.js, gRPC)
                   ├── shippingservice (Go, gRPC)
                   └── emailservice (Python, gRPC)
-```
-
-### AWS infrastructure architecture
-
-```
-Internet
-    │
-    ▼
-Application Load Balancer (public subnets, spans 3 AZs)
-    │
-    ▼
-EKS Worker Nodes (private subnets, 3x t3.medium)
-    │
-    ├── boutique namespace (all 10 services + Redis)
-    ├── argocd namespace (GitOps controller)
-    └── monitoring namespace (Prometheus, Grafana, Jaeger, Alertmanager)
-
-Supporting services:
-    ECR      — container registry (10 repos, one per service)
-    GHCR     — GitHub Container Registry (CI-built images)
-    S3       — Terraform remote state
-    DynamoDB — Terraform state locking
-    NAT GW   — private subnet egress
-    IAM      — node roles + IRSA
 ```
 
 ### Service inventory
@@ -154,12 +132,14 @@ Supporting services:
 │   └── alertmanager-config.yaml  # Slack config — DO NOT COMMIT real webhook URL
 ├── .github/
 │   └── workflows/
-│       ├── helm-lint.yaml         # Helm chart linting
-│       ├── terraform-validate.yaml # Terraform fmt + validate
-│       └── image-scan-push.yaml   # Trivy scan + GHCR push for all 10 services
-├── chaos/                        # coming in Phase 6
-├── runbooks/                     # coming in Phase 6
-└── load-testing/                 # coming in Phase 6
+│       ├── helm-lint.yaml
+│       ├── terraform-validate.yaml
+│       └── image-scan-push.yaml
+├── chaos/                        # LitmusChaos experiment YAMLs
+├── runbooks/                     # Operational runbooks
+├── load-testing/                 # k6 load test scenarios
+└── docs/
+    └── architecture.png          # Full AWS + CI/CD architecture diagram
 ```
 
 ### Everything deleted from upstream and why
@@ -173,9 +153,9 @@ Supporting services:
 | `istio-manifests/` | GCP service mesh, not used | NetworkPolicies in Helm instead |
 | `.github/` | GCP Cloud Build workflows | `.github/workflows/` — GitHub Actions CI |
 | `skaffold.yaml` | GCP-specific dev tool | Replaced by Helm + ArgoCD GitOps |
-| `loadgenerator/` | Black box Locust container | `load-testing/` — custom k6 scenarios *(coming)* |
+| `loadgenerator/` | Black box Locust container | `load-testing/` — custom k6 scenarios |
 | `cloudbuild.yaml` | GCP Cloud Build | GitHub Actions CI pipeline |
-| `docs/` | GCP deployment guides | This README |
+| `docs/` | GCP deployment guides | This README + architecture diagram |
 | `.deploystack/` | GCP-specific tooling | Not needed |
 
 The git history from the upstream repo was also wiped (`rm -rf .git`) and a fresh repository was initialised — so every commit in this repo represents work done on this project, not inherited history from Google.
@@ -267,7 +247,7 @@ securityContext:
 
 **PodDisruptionBudget on all backend services** — `minAvailable: 1` prevents eviction of last running pod.
 
-**Frontend as NodePort, all others as ClusterIP** — all external traffic enters through the frontend only.
+**Frontend serviceType configurable** — `serviceType: NodePort` locally, `serviceType: LoadBalancer` on EKS. Controlled via `values.yaml` so ArgoCD GitOps manages the service type automatically.
 
 ### Debugging a real production issue
 
@@ -289,7 +269,7 @@ kubectl logs frontend-xxx -n boutique
 
 ## Phase 2 — GitOps with ArgoCD
 
-**Status: complete and validated on kind**
+**Status: complete and validated on kind + EKS**
 
 ### How it works
 
@@ -355,7 +335,21 @@ kubectl port-forward svc/argocd-server 8081:80 -n argocd
 
 **Status: complete — infrastructure provisioned, app deployed, resources destroyed**
 
-### Step 1 — Create S3 backend and DynamoDB lock table
+### Step 1 — Create IAM user with required permissions
+
+Create an IAM user `boutique-devops` with these policies:
+- `AmazonEKSClusterPolicy`, `AmazonEKSServicePolicy`, `AmazonEC2FullAccess`
+- `AmazonS3FullAccess`, `AmazonDynamoDBFullAccess`, `IAMFullAccess`
+- `AmazonVPCFullAccess`, `AmazonEC2ContainerRegistryFullAccess`
+- Custom inline policy for `eks:*` and all IAM role operations
+
+```bash
+aws configure --profile boutique
+export AWS_PROFILE=boutique
+aws sts get-caller-identity  # verify
+```
+
+### Step 2 — Create S3 backend and DynamoDB lock table
 
 ```bash
 export AWS_REGION=ap-south-1
@@ -383,7 +377,7 @@ aws dynamodb create-table \
   --region ${AWS_REGION}
 ```
 
-### Step 2 — Configure backend.tf
+### Step 3 — Configure backend.tf
 
 Replace `YOUR_ACCOUNT_ID` in `terraform/envs/prod/backend.tf`:
 
@@ -399,7 +393,7 @@ terraform {
 }
 ```
 
-### Step 3 — Init, plan, apply
+### Step 4 — Init, plan, apply
 
 ```bash
 cd terraform/envs/prod
@@ -410,21 +404,12 @@ terraform apply "tfplan"
 
 Creates 48 resources. EKS takes ~20 minutes total.
 
-### Step 4 — Connect and deploy
+### Step 5 — Connect kubectl to EKS
 
 ```bash
 aws eks update-kubeconfig --region ap-south-1 --name boutique
 kubectl get nodes -o wide
-
-kubectl create namespace boutique
-helm install boutique ./helm --namespace boutique -f helm/values.yaml
-
-kubectl patch svc frontend -n boutique \
-  -p '{"spec": {"type": "LoadBalancer"}}'
-kubectl get svc frontend -n boutique
 ```
-
-Open `http://<EXTERNAL-IP>:8080`
 
 ### Teardown
 
@@ -449,13 +434,13 @@ aws dynamodb delete-table \
 
 ## Phase 4 — Observability
 
-**Status: complete and validated on kind**
+**Status: complete and validated on kind + EKS**
 
 ### Stack overview
 
 ```
 Prometheus      — scrapes metrics from all pods + Kubernetes internals
-Grafana         — dashboards + SLO visualisation (NodePort: 30030)
+Grafana         — dashboards + SLO visualisation
 Alertmanager    — routes alerts to Slack in real time
 kube-state-metrics — cluster-level metrics (pod status, replica counts)
 Node Exporter   — node-level metrics (CPU, memory per node)
@@ -473,46 +458,21 @@ helm repo add jaegertracing https://jaegertracing.github.io/helm-charts
 helm repo update
 ```
 
----
+### IMPORTANT — After every system restart or power off (kind only)
 
-### IMPORTANT — After every system restart or power off
-
-kind nodes lose their inotify limits on every restart. **Always run this first after any restart:**
+kind nodes lose their inotify limits on every restart:
 
 ```bash
-# Step 1 — Fix inotify limits on all kind nodes
 for node in $(kubectl get nodes -o name | sed 's/node\///'); do
   docker exec $node sysctl fs.inotify.max_user_instances=512
   docker exec $node sysctl fs.inotify.max_user_watches=524288
 done
 
-# Step 2 — Restart kube-state-metrics
 kubectl rollout restart deployment/prometheus-kube-state-metrics -n monitoring
-
-# Step 3 — Verify pods are stable
 kubectl get pods -n monitoring
-
-# Step 4 — Get kind node IP (may change after restart)
-kubectl get nodes -o wide | grep worker | head -1 | awk '{print $6}'
 ```
 
-Access services at the new node IP:
-- Grafana → `http://<NODE-IP>:30030` (admin / boutique-grafana)
-- Prometheus → `http://<NODE-IP>:<prometheus-nodeport>`
-- Jaeger → `http://<NODE-IP>:<jaeger-nodeport>`
-
----
-
-### Fresh install — Step 1: Fix inotify limits
-
-```bash
-for node in $(kubectl get nodes -o name | sed 's/node\///'); do
-  docker exec $node sysctl fs.inotify.max_user_instances=512
-  docker exec $node sysctl fs.inotify.max_user_watches=524288
-done
-```
-
-### Fresh install — Step 2: Install kube-prometheus-stack
+### Install kube-prometheus-stack
 
 ```bash
 kubectl create namespace monitoring
@@ -534,11 +494,9 @@ helm install prometheus prometheus-community/kube-prometheus-stack \
 kubectl get pods -n monitoring -w
 ```
 
-**Important notes:**
-- Pin `kube-state-metrics.image.tag=v2.13.0` — v2.18.0 has a liveness probe port mismatch bug
-- The prometheus-operator pod restarts 2-3 times during TLS initialisation — normal, settles in 2 minutes
+**Important:** Pin `kube-state-metrics.image.tag=v2.13.0` — v2.18.0 has a liveness probe port mismatch bug causing permanent CrashLoopBackOff.
 
-### Fresh install — Step 3: Install Jaeger
+### Install Jaeger
 
 ```bash
 helm install jaeger jaegertracing/jaeger \
@@ -554,53 +512,22 @@ helm install jaeger jaegertracing/jaeger \
   --wait=false
 ```
 
-### Fresh install — Step 4: Apply ServiceMonitor and SLO rules
+### Apply ServiceMonitor and SLO rules
 
 ```bash
 kubectl apply -f monitoring/prometheus/servicemonitor.yaml
 kubectl apply -f monitoring/prometheus/rules/slo-rules.yaml
-
-kubectl get servicemonitor -n monitoring | grep boutique
-kubectl get prometheusrule -n monitoring | grep boutique
-```
-
-### Fresh install — Step 5: Expose UIs via NodePort
-
-```bash
-kubectl get nodes -o wide | grep worker | head -1 | awk '{print $6}'
-
-kubectl patch svc prometheus-kube-prometheus-prometheus -n monitoring \
-  --type='json' \
-  -p='[{"op": "replace", "path": "/spec/type", "value": "NodePort"}]'
-
-kubectl patch svc jaeger -n monitoring \
-  --type='json' \
-  -p='[{"op": "replace", "path": "/spec/type", "value": "NodePort"}]'
-
-kubectl get svc -n monitoring | grep NodePort
 ```
 
 ### Slack alerting integration
 
-**Step 1 — Create Slack webhook:**
-
-1. Go to `https://slack.com/get-started` → create free workspace
-2. Create channel `#alerts`
-3. Go to `https://api.slack.com/apps` → **Create New App** → **From scratch**
-4. App name: `AlertManager` → select workspace → **Create App**
-5. **Incoming Webhooks** → toggle ON → **Add New Webhook to Workspace** → select `#alerts` → **Allow**
-6. Copy webhook URL: `https://hooks.slack.com/services/T.../B.../xxx`
-
-**Step 2 — Apply config (never commit real webhook URL to git):**
-
 ```bash
-# Edit monitoring/alertmanager-config.yaml
-# Replace YOUR_SLACK_WEBHOOK_URL with your actual webhook URL
+# Edit monitoring/alertmanager-config.yaml — replace YOUR_SLACK_WEBHOOK_URL
 kubectl apply -f monitoring/alertmanager-config.yaml
 kubectl rollout restart statefulset/alertmanager-prometheus-kube-prometheus-alertmanager -n monitoring
 ```
 
-**Step 3 — Test alert:**
+Test alert:
 
 ```bash
 ALERTMANAGER_POD=$(kubectl get pod -n monitoring \
@@ -608,12 +535,10 @@ ALERTMANAGER_POD=$(kubectl get pod -n monitoring \
   -o jsonpath='{.items[0].metadata.name}')
 
 kubectl exec -n monitoring $ALERTMANAGER_POD -c alertmanager -- wget -qO- \
-  --post-data='[{"labels":{"alertname":"TestAlert","severity":"critical","namespace":"boutique"},"annotations":{"summary":"Test alert from Alertmanager","description":"Slack integration verified"}}]' \
+  --post-data='[{"labels":{"alertname":"TestAlert","severity":"critical","namespace":"boutique"},"annotations":{"summary":"Test alert","description":"Slack integration verified"}}]' \
   --header='Content-Type: application/json' \
   http://localhost:9093/api/v2/alerts
 ```
-
-Check `#alerts` in Slack — alert appears within 30 seconds.
 
 ### SRE Overview dashboard
 
@@ -633,13 +558,13 @@ Dashboards → Import → Upload JSON file
 
 ### Debugging encountered during Phase 4
 
-**Issue 1 — Promtail `too many open files`:** kind nodes have low inotify limits. Fix: increase via `docker exec` before installing log collectors. Rerun after every restart.
+**Issue 1 — Promtail `too many open files`:** kind inotify limits too low. Fix: increase via `docker exec`. Must rerun after every restart.
 
 **Issue 2 — kube-state-metrics CrashLoopBackOff:** v2.18.0 liveness probe port mismatch. Fix: pin to `v2.13.0`.
 
-**Issue 3 — Grafana datasource conflict:** Loki ConfigMap provisioning failed — kube-prometheus-stack already marks Prometheus as default. Fix: add datasources via Grafana UI.
+**Issue 3 — Grafana datasource conflict:** Loki ConfigMap provisioning failed. Fix: add datasources via Grafana UI directly.
 
-**Issue 4 — Prometheus x509 error:** After restart, Prometheus TLS verification failed scraping boutique namespace. Fix: `tlsConfig.insecureSkipVerify: true` in ServiceMonitor.
+**Issue 4 — Prometheus x509 error scraping boutique namespace:** TLS certificate verification failure after restart. Fix: `tlsConfig.insecureSkipVerify: true` in ServiceMonitor.
 
 ---
 
@@ -652,62 +577,215 @@ Dashboards → Import → Upload JSON file
 ```
 Push to main
       │
-      ├── helm/** changed → Helm Lint workflow
+      ├── helm/** changed → Helm Lint
       │     └── helm lint + helm template dry run
       │
-      ├── terraform/** changed → Terraform Validate workflow
+      ├── terraform/** changed → Terraform Validate
       │     └── terraform fmt check + validate all 3 modules
       │
-      └── helm/** changed → Image Scan and Push workflow
+      └── helm/** changed → Image Scan and Push
             ├── Pull upstream image from Google registry
             ├── Trivy security scan (CRITICAL + HIGH CVEs)
             ├── Upload scan results as GitHub artifacts
-            └── Tag + push to GHCR (ghcr.io/shrinidhi972004/boutique/)
+            └── Tag + push to GHCR
 ```
 
-Every commit that touches `helm/` or `terraform/` automatically triggers the relevant pipeline. No manual steps.
+### Workflow 1 — Helm Lint
 
-### Workflow 1 — Helm Lint (`.github/workflows/helm-lint.yaml`)
+Triggers on `helm/**` changes. Runs `helm lint` + `helm template` dry run across all 10 services.
 
-Triggers on any change to `helm/**`. Runs:
-- `helm lint ./helm` — validates chart structure and values
-- `helm template` dry run — ensures all 10 services render correctly
-- Counts rendered resource types to verify nothing is missing
+### Workflow 2 — Terraform Validate
 
-### Workflow 2 — Terraform Validate (`.github/workflows/terraform-validate.yaml`)
+Triggers on `terraform/**` changes. Runs `terraform fmt -check` + `terraform validate` on all 3 modules.
 
-Triggers on any change to `terraform/**`. Runs:
-- `terraform fmt -check -recursive` — enforces consistent formatting
-- `terraform init -backend=false` + `terraform validate` on each of the 3 modules (vpc, eks, ecr) independently
+**Important:** Use Terraform `>= 1.9.0` — older versions have an expired OpenPGP signing key causing CI failures.
 
-**Important:** Use Terraform `>= 1.9.0` in CI. Older versions use an expired OpenPGP key for the AWS provider that causes `error checking signature: openpgp: key expired` in GitHub Actions runners.
+### Workflow 3 — Image Scan and Push
 
-### Workflow 3 — Image Scan and Push (`.github/workflows/image-scan-push.yaml`)
+Runs 10 parallel jobs — one per service. Pulls upstream images, scans with Trivy, pushes to GHCR:
 
-Triggers on any change to `helm/**` or manually via `workflow_dispatch`. Runs a matrix of 10 parallel jobs — one per service:
-
-- Pulls upstream image from `gcr.io/google-samples/microservices-demo/`
-- Scans with Trivy for CRITICAL and HIGH CVEs
-- Uploads scan report as a downloadable GitHub artifact
-- Tags and pushes to GHCR: `ghcr.io/shrinidhi972004/boutique/<service>:latest`
-
-All 10 images are available at:
 ```
 ghcr.io/shrinidhi972004/boutique/frontend:latest
 ghcr.io/shrinidhi972004/boutique/cartservice:latest
-ghcr.io/shrinidhi972004/boutique/checkoutservice:latest
 ... (10 total)
 ```
 
 ### Debugging encountered during Phase 5
 
-**Issue 1 — Terraform OpenPGP key expired:** GitHub Actions runners had an expired HashiCorp signing key causing provider installation to fail. Fix: upgrade to `terraform_version: 1.9.0` in the workflow which ships with an updated key.
+**Issue 1 — Terraform OpenPGP key expired:** Fix: upgrade to `terraform_version: 1.9.0`.
 
-**Issue 2 — Terraform fmt check failure:** Our Terraform files weren't consistently formatted. Fix: run `terraform fmt -recursive terraform/` locally and commit the changes before the fmt check passes in CI.
+**Issue 2 — Terraform fmt check failure:** Fix: run `terraform fmt -recursive terraform/` locally and commit.
 
-**Issue 3 — GHCR image push failed with invalid reference:** GitHub's `${{ github.repository_owner }}` variable preserves original casing (`Shrinidhi972004`) but GHCR requires all lowercase. Fix: use a shell variable with hardcoded lowercase path instead of the GitHub context variable.
+**Issue 3 — GHCR push invalid reference:** `github.repository_owner` preserves uppercase. Fix: hardcode lowercase `ghcr.io/shrinidhi972004/boutique/` as a shell variable.
 
-**Issue 4 — Slack webhook URL blocked by GitHub push protection:** Committed the real Slack webhook URL to `alertmanager-config.yaml` — GitHub's secret scanning blocked the push. Fix: use `git filter-branch` to rewrite history removing the file, then use a placeholder `YOUR_SLACK_WEBHOOK_URL` going forward. Add `monitoring/alertmanager-config.yaml` to `.gitignore`.
+**Issue 4 — Slack webhook blocked by GitHub push protection:** Fix: `git filter-branch` to rewrite history, add file to `.gitignore`.
+
+---
+
+## Phase 6 — Full EKS Production Deployment
+
+**Status: complete — all components deployed on AWS EKS, screenshots taken, resources destroyed**
+
+This phase brings everything together — all 5 phases deployed simultaneously on a real AWS EKS cluster, proving the entire platform works end-to-end in production.
+
+### What was deployed on EKS
+
+```
+boutique namespace   — all 10 microservices + Redis (Helm)
+argocd namespace     — ArgoCD GitOps controller (Helm)
+monitoring namespace — Prometheus + Grafana + Alertmanager + Jaeger (Helm)
+```
+
+All deployed with zero manual `kubectl apply` — Helm for initial install, ArgoCD managing ongoing state.
+
+### Full deployment steps
+
+**Step 1 — Provision EKS with Terraform (see Phase 3)**
+
+```bash
+cd terraform/envs/prod
+terraform apply "tfplan"
+aws eks update-kubeconfig --region ap-south-1 --name boutique
+kubectl get nodes -o wide
+```
+
+**Step 2 — Deploy boutique app**
+
+```bash
+kubectl create namespace boutique
+helm install boutique ./helm \
+  --namespace boutique \
+  -f helm/values.yaml
+kubectl get pods -n boutique
+```
+
+**Step 3 — Deploy ArgoCD**
+
+```bash
+kubectl create namespace argocd
+helm install argocd argo/argo-cd \
+  --namespace argocd \
+  --set configs.params."server\.insecure"=true
+
+# Expose UI via LoadBalancer
+kubectl patch svc argocd-server -n argocd \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+# Get admin password
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d && echo
+
+# Connect ArgoCD to GitHub repo
+kubectl apply -f argocd/application.yaml
+kubectl get application -n argocd
+# Expected: SYNC STATUS = Synced, HEALTH STATUS = Healthy
+```
+
+**Step 4 — Deploy observability stack**
+
+```bash
+kubectl create namespace monitoring
+
+helm install prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --timeout 10m \
+  --wait=false \
+  --set prometheus.prometheusSpec.retention=7d \
+  --set grafana.adminPassword=boutique-grafana \
+  --set alertmanager.enabled=true \
+  --set nodeExporter.enabled=true \
+  --set kubeStateMetrics.enabled=true \
+  --set kube-state-metrics.image.tag=v2.13.0
+
+helm install jaeger jaegertracing/jaeger \
+  --namespace monitoring \
+  --set allInOne.enabled=true \
+  --set provisionDataStore.cassandra=false \
+  --set provisionDataStore.elasticsearch=false \
+  --set storage.type=memory \
+  --set agent.enabled=false \
+  --set collector.enabled=false \
+  --set query.enabled=false \
+  --wait=false
+
+kubectl apply -f monitoring/prometheus/servicemonitor.yaml
+kubectl apply -f monitoring/prometheus/rules/slo-rules.yaml
+```
+
+**Step 5 — Expose all UIs via LoadBalancer**
+
+```bash
+# Grafana
+kubectl patch svc prometheus-grafana -n monitoring \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+# ArgoCD already patched in Step 3
+
+# Get all external IPs
+kubectl get svc -A | grep LoadBalancer
+```
+
+**Step 6 — Configure Alertmanager → Slack**
+
+```bash
+# Edit monitoring/alertmanager-config.yaml with real webhook URL
+kubectl apply -f monitoring/alertmanager-config.yaml
+kubectl rollout restart statefulset/alertmanager-prometheus-kube-prometheus-alertmanager -n monitoring
+```
+
+**Step 7 — Configure frontend as LoadBalancer via GitOps**
+
+Rather than manually patching the service (which ArgoCD would revert due to `selfHeal: true`), update `values.yaml` to set `serviceType: LoadBalancer` for frontend and push to GitHub. ArgoCD auto-syncs the change and AWS provisions the ELB:
+
+```bash
+# In helm/values.yaml — add under frontend:
+#   serviceType: LoadBalancer
+git add helm/values.yaml helm/templates/service.yaml
+git commit -m "feat(helm): frontend LoadBalancer for EKS"
+git push origin main
+# ArgoCD syncs within 3 minutes — ELB appears automatically
+kubectl get svc frontend -n boutique -w
+```
+
+**Step 8 — Verify everything**
+
+```bash
+kubectl get pods -n boutique      # 11 pods Running
+kubectl get pods -n monitoring    # 9 pods Running
+kubectl get pods -n argocd        # 7 pods Running
+kubectl get application -n argocd # Synced + Healthy
+kubectl get svc -A | grep LoadBalancer
+```
+
+Access:
+- Online Boutique → `http://<frontend-elb>:8080`
+- ArgoCD UI → `http://<argocd-elb>`
+- Grafana → `http://<grafana-elb>` (admin / boutique-grafana)
+
+### GitOps proven on EKS
+
+The ArgoCD `selfHeal: true` setting was demonstrated live — manually patching the frontend service type was immediately reverted by ArgoCD. The correct fix was to update `values.yaml` in GitHub and let ArgoCD reconcile it. This proves GitHub is truly the single source of truth.
+
+### Teardown — complete cleanup
+
+```bash
+helm uninstall boutique -n boutique
+helm uninstall prometheus -n monitoring
+helm uninstall jaeger -n monitoring
+helm uninstall argocd -n argocd
+
+cd terraform/envs/prod
+terraform destroy -auto-approve
+
+# Verify zero resources remain
+aws eks list-clusters --region ap-south-1
+aws ec2 describe-instances --region ap-south-1 \
+  --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' --output table
+aws elbv2 describe-load-balancers --region ap-south-1 \
+  --query 'LoadBalancers[*].[LoadBalancerName,State.Code]' --output table
+aws ec2 describe-nat-gateways --region ap-south-1 \
+  --query 'NatGateways[?State!=`deleted`].[NatGatewayId,State]' --output table
+```
 
 ---
 
@@ -716,11 +794,11 @@ ghcr.io/shrinidhi972004/boutique/checkoutservice:latest
 | Phase | Status | Description |
 |---|---|---|
 | Phase 1 — Helm chart | ✅ Complete | Single Helm chart for all 10 services, validated on kind |
-| Phase 2 — GitOps with ArgoCD | ✅ Complete | ArgoCD watching GitHub, auto-sync with self-healing on every push |
-| Phase 3 — Terraform + AWS EKS | ✅ Complete | Modular Terraform, EKS cluster, same Helm chart promoted to AWS |
-| Phase 4 — Observability | ✅ Complete | Prometheus + Grafana + Jaeger + Alertmanager → Slack alerts |
+| Phase 2 — GitOps with ArgoCD | ✅ Complete | ArgoCD watching GitHub, auto-sync with self-healing |
+| Phase 3 — Terraform + AWS EKS | ✅ Complete | Modular Terraform, EKS cluster, VPC, ECR |
+| Phase 4 — Observability | ✅ Complete | Prometheus + Grafana + Jaeger + Alertmanager → Slack |
 | Phase 5 — CI/CD | ✅ Complete | GitHub Actions — Helm lint, Terraform validate, Trivy scan, GHCR push |
-| Phase 6 — Chaos engineering | 🔄 In progress | LitmusChaos experiments on EKS, k6 load tests, postmortems, runbooks |
+| Phase 6 — Full EKS deployment | ✅ Complete | All phases deployed together on AWS EKS, GitOps proven end-to-end |
 
 ---
 
@@ -738,10 +816,8 @@ ghcr.io/shrinidhi972004/boutique/checkoutservice:latest
 | Metrics | Prometheus + Grafana |
 | Alerting | Alertmanager + Slack |
 | Tracing | Jaeger |
-| Chaos engineering | LitmusChaos *(coming)* |
-| Load testing | k6 *(coming)* |
 | Container registry | AWS ECR |
-| Cloud | AWS (EKS, ECR, S3, VPC, DynamoDB, IAM) |
+| Cloud | AWS (EKS, ECR, S3, VPC, DynamoDB, IAM, ALB) |
 
 ---
 

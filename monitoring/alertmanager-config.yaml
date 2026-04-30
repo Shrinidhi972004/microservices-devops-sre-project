@@ -7,7 +7,7 @@ stringData:
   alertmanager.yaml: |
     global:
       resolve_timeout: 5m
-      slack_api_url: 'links-to-slack-webhook'
+      slack_api_url: 'replace with your slack webhook url'
     route:
       group_by: ['alertname', 'namespace']
       group_wait: 30s
